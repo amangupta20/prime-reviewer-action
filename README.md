@@ -67,3 +67,36 @@ model keys or GitHub writes. A live model review is separate validation.
 the built-in image generation tool on 2026-11-03. Prompt: a friendly robot
 owl with a check-mark face and prime accent, bold flat geometry on a dark
 square background, legible at avatar size, no text or existing brand logos.
+
+## B2 runtime storage
+
+Set `state-backend: b2` and provide `b2-endpoint-url`, `b2-bucket`, `b2-region`,
+`b2-access-key-id` and `b2-secret-access-key` using caller secrets. The key is
+scoped to the private reviewer bucket, with read, list and write access.
+The action installs boto3 1.42.4. Its model subprocess never receives those
+credentials. Older callers default to `auto`, retaining Git state when no B2
+inputs are supplied; partial B2 input is an error.
+
+B2 keys are namespaced by owner, repository and PR. A completed run uploads
+its raw trace bundle and session snapshot before updating its latest pointer.
+Only this PR's latest state is fetched for review/update/carry mode. Missing
+saved state on an instruction is an error. Storage failures fail the job.
+No retention or deletion runs automatically. Bucket names and credentials
+are omitted from public summaries.
+
+`observability.md` describes how a future importer can replay these private
+raw archives into a chosen viewer. No exporter or viewer is deployed yet.
+
+`migrate_state.py` imports a clean, frozen Git state checkout. Default mode
+checks source and destination without writing; `--apply` uploads additive
+objects, then downloads sessions and root/child transcripts and compares
+contents. It rejects a destination with different existing state. Old Git
+state remains intact. The coordinator must finish legacy runs and use their
+last state snapshot before switching the caller to B2.
+
+Example (replace paths; UNTESTED until deployment verification):
+
+```sh
+python3 -I migrate_state.py --source /path/to/state-checkout --repo owner/repo
+python3 -I migrate_state.py --source /path/to/state-checkout --repo owner/repo --apply
+```

@@ -32,6 +32,31 @@ inputs:
     required: false
     default: ""
 
+  state-backend:
+    description: auto retains Git compatibility when B2 inputs are absent; b2 requires B2 configuration.
+    required: false
+    default: auto
+  b2-endpoint-url:
+    description: Private B2 S3 endpoint; configure all B2 inputs to enable object storage.
+    required: false
+    default: ""
+  b2-bucket:
+    description: Dedicated private reviewer bucket name.
+    required: false
+    default: ""
+  b2-region:
+    description: B2 S3 region.
+    required: false
+    default: ""
+  b2-access-key-id:
+    description: Application key ID scoped to the reviewer bucket.
+    required: false
+    default: ""
+  b2-secret-access-key:
+    description: Application key scoped to the reviewer bucket.
+    required: false
+    default: ""
+
 runs:
   using: composite
   steps:
@@ -54,6 +79,29 @@ runs:
           || { [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$REPO" ]; }; then
           echo "Not reviewed: the Prime reviewer only runs on the owner's own pull requests and comments. The owner reviews this one by hand."
           exit 1
+        fi
+
+    - name: Validate requested state backend
+      shell: bash
+      env:
+        BACKEND: ${{ inputs.state-backend }}
+        B2_ENDPOINT_URL: ${{ inputs.b2-endpoint-url }}
+        B2_BUCKET: ${{ inputs.b2-bucket }}
+        B2_REGION: ${{ inputs.b2-region }}
+        B2_ACCESS_KEY_ID: ${{ inputs.b2-access-key-id }}
+        B2_SECRET_ACCESS_KEY: ${{ inputs.b2-secret-access-key }}
+      run: |
+        case "$BACKEND" in
+          auto|b2) ;;
+          *) echo "Unknown state backend"; exit 1 ;;
+        esac
+        if [ "$BACKEND" = b2 ]; then
+          for name in B2_ENDPOINT_URL B2_BUCKET B2_REGION B2_ACCESS_KEY_ID B2_SECRET_ACCESS_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "B2 state storage requested but a required input is missing."
+              exit 1
+            fi
+          done
         fi
 
     - name: Config repo name
@@ -119,12 +167,23 @@ runs:
         sh "$RUNNER_TEMP/install.sh"
         ~/.local/bin/prime-agent --version
 
+    - name: Install object storage client
+      if: inputs.b2-bucket != ''
+      shell: bash
+      run: python3 -m pip install --disable-pip-version-check 'boto3==1.42.4'
+
     # Event text (comments, the PR body) reaches the script through the
     # environment, never pasted into a shell line.
     - name: Run the reviewer
       shell: bash
       env:
+        B2_ENDPOINT_URL: ${{ inputs.b2-endpoint-url }}
+        B2_BUCKET: ${{ inputs.b2-bucket }}
+        B2_REGION: ${{ inputs.b2-region }}
+        B2_ACCESS_KEY_ID: ${{ inputs.b2-access-key-id }}
+        B2_SECRET_ACCESS_KEY: ${{ inputs.b2-secret-access-key }}
         GH_TOKEN: ${{ steps.app.outputs.token }}
+        STATE_BACKEND: ${{ inputs.state-backend }}
         APP_SLUG: ${{ steps.app.outputs.app-slug }}
         OPENCODE_API_KEY: ${{ inputs.opencode-api-key }}
         CONFIG_REPO: ${{ steps.cfg.outputs.full }}
