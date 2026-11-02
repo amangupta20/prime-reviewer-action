@@ -1,6 +1,7 @@
 """Offline regression tests for configuration, isolation and proposed lessons."""
 import json
 import os
+import sys
 from pathlib import Path
 import runpy
 import subprocess
@@ -8,7 +9,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'prime-review.py'
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+SCRIPT = REPO_ROOT / 'prime-review.py'
 
 
 class ReviewerTests(unittest.TestCase):

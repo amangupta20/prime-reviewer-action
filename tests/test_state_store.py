@@ -19,12 +19,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import state_store
 from state_store import (
     B2StateStore,
     CorruptArchiveError,
     SessionNotFoundError,
     StorageError,
+    any_b2_configured,
     create_session_tar,
     create_trace_bundle,
     is_b2_configured,
@@ -33,7 +38,7 @@ from state_store import (
     validate_b2_config,
 )
 
-SCRIPT = Path(__file__).resolve().parents[1] / "prime-review.py"
+SCRIPT = REPO_ROOT / "prime-review.py"
 
 
 class FakeS3ClientError(Exception):
@@ -285,17 +290,100 @@ class B2StateStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.restore_session(dest))
         self.assertFalse(self.store.has_saved_session())
 
-        # 2. 403 Forbidden / AccessDenied: must raise StorageError, NEVER return None
+        # 2. Structured error codes: inspects error code only
+        self.assertTrue(is_not_found(FakeS3ClientError("NoSuchKey", "Key not found", 404)))
+        self.assertTrue(is_not_found(FakeS3ClientError("NotFound", "Not found", 404)))
+        self.assertTrue(is_not_found(FakeS3ClientError("404", "Not found", 404)))
+        # NoSuchBucket must return False so it fails rather than meaning missing PR
+        self.assertFalse(is_not_found(FakeS3ClientError("NoSuchBucket", "Bucket not found", 404)))
+        # Generic exception text with 404 must not mean missing
+        self.assertFalse(is_not_found(Exception("Request failed with 404 error")))
+        self.assertFalse(is_not_found(FakeS3ClientError("AccessDenied", "Forbidden", 403)))
+
+        # 3. NoSuchBucket causes restore_session to fail explicitly
         latest_key = self.store.latest_key
+        self.client.fail_get_keys[latest_key] = FakeS3ClientError("NoSuchBucket", "Bucket not found", 404)
+        with self.assertRaises(StorageError):
+            self.store.restore_session(dest)
+        del self.client.fail_get_keys[latest_key]
+
+        # 4. 403 Forbidden / AccessDenied: must raise StorageError, NEVER return None
         self.client.fail_get_keys[latest_key] = FakeS3ClientError("AccessDenied", "Forbidden", 403)
         with self.assertRaises(StorageError) as cm:
             self.store.restore_session(dest)
         self.assertIn("B2 storage read error", str(cm.exception))
 
-        # 3. ConnectionError / 500: must raise StorageError
+        # 5. ConnectionError / 500: must raise StorageError
         self.client.fail_get_keys[latest_key] = FakeS3ClientError("ServiceUnavailable", "503", 503)
         with self.assertRaises(StorageError):
             self.store.restore_session(dest)
+
+    def test_partial_b2_inputs_in_auto_mode_rejected(self):
+        base_env = {
+            "REPO": "test-owner/test-repo",
+            "OWNER": "test-owner",
+            "PR_NUMBER": "42",
+            "RUN_ID": "run-test",
+            "RUN_URL": "https://example.com/run",
+            "EVENT_NAME": "pull_request_target",
+            "GH_TOKEN": "token",
+            "STATE_BACKEND": "auto",
+        }
+        all_b2 = {
+            "B2_ENDPOINT_URL": "https://s3.example.com",
+            "B2_BUCKET": "bucket",
+            "B2_REGION": "us-east-1",
+            "B2_ACCESS_KEY_ID": "key",
+            "B2_SECRET_ACCESS_KEY": "secret",
+        }
+
+        # 0 variables: auto mode cleanly selects Git mode
+        env_zero = dict(base_env)
+        self.assertFalse(any_b2_configured(env_zero))
+        self.assertFalse(is_b2_configured(env_zero))
+
+        # All 5 variables: auto mode cleanly selects B2 mode
+        env_all = {**base_env, **all_b2}
+        self.assertTrue(any_b2_configured(env_all))
+        self.assertTrue(is_b2_configured(env_all))
+
+        # 1 to 4 variables: must be rejected!
+        for key in all_b2:
+            env_partial = {**base_env, **all_b2}
+            del env_partial[key]
+            self.assertTrue(any_b2_configured(env_partial))
+            self.assertFalse(is_b2_configured(env_partial))
+            with self.assertRaises(StorageError):
+                validate_b2_config(env_partial)
+
+    def test_unknown_state_backend_rejected(self):
+        env = {
+            "REPO": "test-owner/test-repo",
+            "OWNER": "test-owner",
+            "PR_NUMBER": "42",
+            "RUN_ID": "run-test",
+            "RUN_URL": "https://example.com/run",
+            "EVENT_NAME": "pull_request_target",
+            "GH_TOKEN": "token",
+            "STATE_BACKEND": "invalid_backend",
+        }
+        agent_dir = self.work / "agent"
+        repo_dir = agent_dir / "repos/test-repo"
+        repo_dir.mkdir(parents=True)
+        (repo_dir / "config.toml").write_text('rules = []\nprotected = []\nblocking_sections = []\nfix_check = ""\n')
+        (repo_dir / "playbook").mkdir(parents=True)
+        (repo_dir / "playbook/SKILL.md").write_text("playbook")
+
+        prior = Path.cwd()
+        os.chdir(self.work)
+        try:
+            with patch.dict(os.environ, env, clear=True):
+                import runpy
+                with self.assertRaises(StorageError) as cm:
+                    runpy.run_path(str(SCRIPT), run_name="test_bad_backend")
+                self.assertIn("Unknown STATE_BACKEND", str(cm.exception))
+        finally:
+            os.chdir(prior)
 
     def test_instruct_mode_missing_session_fails(self):
         # When in instruct mode, if session does not exist, SessionNotFoundError is raised
@@ -349,6 +437,37 @@ class B2StateStoreTests(unittest.TestCase):
             tar.addfile(ti)
         with self.assertRaises(CorruptArchiveError):
             safe_extract_tar(buf.getvalue(), dest)
+
+        # 5. FIFO member
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            ti = tarfile.TarInfo(name="fifo_member")
+            ti.type = tarfile.FIFOTYPE
+            tar.addfile(ti)
+        with self.assertRaises(CorruptArchiveError):
+            safe_extract_tar(buf.getvalue(), dest)
+
+        # 6. Character device member
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            ti = tarfile.TarInfo(name="char_dev")
+            ti.type = tarfile.CHRTYPE
+            tar.addfile(ti)
+        with self.assertRaises(CorruptArchiveError):
+            safe_extract_tar(buf.getvalue(), dest)
+
+        # 7. Block device member
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            ti = tarfile.TarInfo(name="blk_dev")
+            ti.type = tarfile.BLKTYPE
+            tar.addfile(ti)
+        with self.assertRaises(CorruptArchiveError):
+            safe_extract_tar(buf.getvalue(), dest)
+
+        # 8. Malformed corrupted archive
+        with self.assertRaises(CorruptArchiveError):
+            safe_extract_tar(b"\x1f\x8b\x08corrupt-data", dest)
 
     def test_list_traces(self):
         self.store.save_state("r1", {"head_after": "h1"}, None, self.work, [])
@@ -467,6 +586,37 @@ fix_check = ""
         finally:
             os.chdir(prior)
 
+    def test_write_summary_does_not_expose_bucket_name(self):
+        store = B2StateStore("test-bucket", "owner", "owner/homelab", "7", client=self.client)
+        summary_file = self.work / "step_summary.md"
+        meta = {
+            "mode": "review",
+            "verdict": "approve",
+            "gate_blockers": [],
+            "findings": 0,
+            "fixes_pushed": 0,
+            "duration_s": 10,
+            "usage": {},
+            "model": "deepseek",
+        }
+        prior = Path.cwd()
+        os.chdir(self.work)
+        try:
+            with patch.dict(os.environ, {**self.env, "GITHUB_STEP_SUMMARY": str(summary_file)}):
+                with patch("state_store.B2StateStore.from_env", return_value=store):
+                    import runpy
+                    mod = runpy.run_path(str(SCRIPT), run_name="test_summary")
+                    mod["B2_STORE"] = store
+                    mod["write_summary"](meta)
+            summary_content = summary_file.read_text()
+            # Must show backend name and repo/run-relative trace identifier
+            self.assertIn("b2:traces/owner/homelab/7/test-b2-1.tar.gz", summary_content)
+            # Must NOT expose private bucket name or endpoint
+            self.assertNotIn("test-bucket", summary_content)
+            self.assertNotIn("us-west-000", summary_content)
+        finally:
+            os.chdir(prior)
+
 
 class IsolatedPythonEntrypointTests(unittest.TestCase):
     """Verify python3 -I execution from an unrelated working directory."""
@@ -476,16 +626,6 @@ class IsolatedPythonEntrypointTests(unittest.TestCase):
         self.addCleanup(unrelated_tmp.cleanup)
         unrelated_cwd = unrelated_tmp.name
 
-        # Run python3 -I with script from unrelated CWD
-        cmd = [
-            sys.executable,
-            "-I",
-            "-c",
-            f"import runpy, sys; sys.path = [p for p in sys.path if p != '{SCRIPT.parent}']; "
-            f"import state_store; print(state_store.__file__)",
-        ]
-        # First verify that sys.path does not contain script directory by default,
-        # but prime-review.py bootstrap ensures state_store is loadable.
         test_script = f"""
 import sys
 import runpy
@@ -494,12 +634,10 @@ from pathlib import Path
 # Simulate running under isolated python from unrelated directory
 script_path = "{SCRIPT}"
 try:
-    # Run the script module in a sandboxed way
     mod = runpy.run_path(script_path, run_name="isolated_test")
 except SystemExit:
     pass
 except KeyError:
-    # Missing env vars in bare run is expected, but ModuleNotFoundError is NOT
     pass
 """
         res = subprocess.run(
@@ -507,8 +645,11 @@ except KeyError:
             cwd=unrelated_cwd,
             capture_output=True,
             text=True,
+            timeout=10,
         )
+        self.assertEqual(res.returncode, 0, res.stderr)
         self.assertNotIn("ModuleNotFoundError: No module named 'state_store'", res.stderr)
+
 
 
 if __name__ == "__main__":

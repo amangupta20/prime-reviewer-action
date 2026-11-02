@@ -59,6 +59,12 @@ def is_b2_configured(env: dict[str, str] | None = None) -> bool:
     return all(bool(source.get(k, "").strip()) for k in B2_ENV_VARS)
 
 
+def any_b2_configured(env: dict[str, str] | None = None) -> bool:
+    """Return True if at least one B2 environment variable is present and non-empty."""
+    source = os.environ if env is None else env
+    return any(bool(source.get(k, "").strip()) for k in B2_ENV_VARS)
+
+
 def validate_b2_config(env: dict[str, str] | None = None) -> dict[str, str]:
     """Return dict of B2 configuration or raise StorageError if any required variable is missing."""
     source = os.environ if env is None else env
@@ -69,74 +75,88 @@ def validate_b2_config(env: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def is_not_found(exc: Exception) -> bool:
-    """Return True if an exception represents a 404 / NoSuchKey / NotFound condition."""
+    """Return True if an exception represents a missing object (NoSuchKey / NotFound / 404).
+
+    Inspects structured S3 error codes only.
+    NoSuchBucket must fail and NOT be treated as a missing object.
+    Generic exception strings containing '404' are never treated as not-found.
+    """
     if hasattr(exc, "response") and isinstance(exc.response, dict):
         err = exc.response.get("Error", {})
-        code = str(err.get("Code", ""))
-        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-        if code in ("NoSuchKey", "404", "NotFound") or status == 404:
+        code = str(err.get("Code", "")).strip()
+        if code in ("NoSuchBucket", "AccessDenied", "Forbidden", "InvalidBucketName"):
+            return False
+        if code in ("NoSuchKey", "NotFound", "404"):
             return True
-    msg = str(exc)
-    if ("NoSuchKey" in msg or "404" in msg or "NotFound" in msg) and not any(
-        k in msg for k in ("403", "AccessDenied", "Forbidden", "InvalidAccessKey", "SignatureDoesNotMatch")
-    ):
-        return True
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status == 404 and (not code or code in ("404", "NotFound", "NoSuchKey")):
+            return True
     return False
 
 
 def safe_extract_tar(archive_source: Path | bytes | io.BytesIO, dest_dir: Path) -> list[str]:
     """Extract tar.gz safely into dest_dir.
 
-    Rejects directory traversal, absolute paths, symlinks, and hardlinks.
+    Allows only regular files and directories. Rejects symlinks, hardlinks, devices,
+    FIFOs, directory traversal, absolute paths, and escaping members before any extraction.
+    Catches malformed/corrupted archives with CorruptArchiveError.
     Returns list of extracted member names.
     """
     dest_dir = dest_dir.resolve()
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    if isinstance(archive_source, (bytes, bytearray)):
-        fileobj = io.BytesIO(archive_source)
-        tar_context = tarfile.open(fileobj=fileobj, mode="r:gz")
-    elif isinstance(archive_source, (io.BytesIO, io.BufferedReader)):
-        tar_context = tarfile.open(fileobj=archive_source, mode="r:gz")
-    else:
-        tar_context = tarfile.open(archive_source, mode="r:gz")
+    try:
+        if isinstance(archive_source, (bytes, bytearray)):
+            fileobj = io.BytesIO(archive_source)
+            tar_context = tarfile.open(fileobj=fileobj, mode="r:gz")
+        elif isinstance(archive_source, (io.BytesIO, io.BufferedReader)):
+            tar_context = tarfile.open(fileobj=archive_source, mode="r:gz")
+        else:
+            tar_context = tarfile.open(archive_source, mode="r:gz")
+    except Exception:
+        raise CorruptArchiveError("Malformed or corrupt archive: failed to read archive") from None
 
     extracted_members: list[str] = []
-    with tar_context as tar:
-        members = tar.getmembers()
-        for member in members:
-            # 1. Reject symlinks and hardlinks
-            if member.issym() or member.islnk() or member.type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
-                raise CorruptArchiveError(
-                    f"Archive member is a symlink or hardlink: safe extraction rejected"
-                )
+    try:
+        with tar_context as tar:
+            members = tar.getmembers()
+            for member in members:
+                # 1. Allow only regular files and directories (reject symlinks, hardlinks, devices, FIFOs, specials)
+                if not (member.isfile() or member.isdir()):
+                    raise CorruptArchiveError(
+                        f"Archive member is not a regular file or directory: safe extraction rejected"
+                    )
 
-            # 2. Reject absolute paths
-            if member.name.startswith("/") or os.path.isabs(member.name) or Path(member.name).is_absolute():
-                raise CorruptArchiveError(
-                    f"Archive member has an absolute path: safe extraction rejected"
-                )
+                # 2. Reject absolute paths
+                if member.name.startswith("/") or os.path.isabs(member.name) or Path(member.name).is_absolute():
+                    raise CorruptArchiveError(
+                        f"Archive member has an absolute path: safe extraction rejected"
+                    )
 
-            # 3. Reject directory traversal
-            parts = Path(member.name).parts
-            if ".." in parts:
-                raise CorruptArchiveError(
-                    f"Archive member contains path traversal (..): safe extraction rejected"
-                )
+                # 3. Reject directory traversal
+                parts = Path(member.name).parts
+                if ".." in parts:
+                    raise CorruptArchiveError(
+                        f"Archive member contains path traversal (..): safe extraction rejected"
+                    )
 
-            resolved_target = (dest_dir / member.name).resolve()
-            if not (resolved_target == dest_dir or resolved_target.is_relative_to(dest_dir)):
-                raise CorruptArchiveError(
-                    f"Archive member escapes destination directory: safe extraction rejected"
-                )
+                resolved_target = (dest_dir / member.name).resolve()
+                if not (resolved_target == dest_dir or resolved_target.is_relative_to(dest_dir)):
+                    raise CorruptArchiveError(
+                        f"Archive member escapes destination directory: safe extraction rejected"
+                    )
 
-        # Extraction after all members are verified
-        for member in members:
-            if hasattr(tarfile, "data_filter"):
-                tar.extract(member, path=dest_dir, filter=lambda m, p: m)
-            else:
-                tar.extract(member, path=dest_dir)
-            extracted_members.append(member.name)
+            # Extraction after all members are verified
+            for member in members:
+                if hasattr(tarfile, "data_filter"):
+                    tar.extract(member, path=dest_dir, filter="data")
+                else:
+                    tar.extract(member, path=dest_dir)
+                extracted_members.append(member.name)
+    except CorruptArchiveError:
+        raise
+    except Exception:
+        raise CorruptArchiveError("Malformed or corrupt archive: safe extraction failed") from None
 
     return extracted_members
 
@@ -241,7 +261,8 @@ class B2StateStore:
                     region_name=region,
                     aws_access_key_id=access_key_id,
                     aws_secret_access_key=secret_access_key,
-                    config=Config(signature_version="s3v4") if Config else None,
+                    config=Config(signature_version="s3v4", request_checksum_calculation="when_required",
+                                  response_checksum_validation="when_required") if Config else None,
                 )
             except Exception as e:
                 raise StorageError(f"Failed to initialize B2 client: {type(e).__name__}") from None

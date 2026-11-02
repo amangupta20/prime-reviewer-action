@@ -69,14 +69,22 @@ EVENT = os.environ["EVENT_NAME"]
 TOKEN = os.environ["GH_TOKEN"]
 
 STATE_BACKEND = os.environ.get("STATE_BACKEND", "auto").strip().lower()
+if STATE_BACKEND not in ("auto", "b2", "git"):
+    raise state_store.StorageError(
+        f"Unknown STATE_BACKEND '{STATE_BACKEND}': must be 'auto', 'b2', or 'git'"
+    )
+
 if STATE_BACKEND == "b2":
-    if not state_store.is_b2_configured():
-        state_store.validate_b2_config()
+    state_store.validate_b2_config()
     B2_MODE = True
 elif STATE_BACKEND == "git":
     B2_MODE = False
 else:  # auto
-    B2_MODE = state_store.is_b2_configured()
+    if state_store.any_b2_configured():
+        state_store.validate_b2_config()
+        B2_MODE = True
+    else:
+        B2_MODE = False
 
 B2_STORE: state_store.B2StateStore | None = None
 
@@ -719,7 +727,7 @@ def write_summary(meta: dict) -> None:
     u = meta.get("usage") or {}
     store = get_b2_store() if B2_MODE else None
     trace_label = (
-        f"b2:{store.bucket}/{store.trace_key(RUN_ID)}"
+        f"b2:{store.trace_key(RUN_ID)}"
         if B2_MODE and store
         else f"state:traces/{RUN_ID}/"
     )
