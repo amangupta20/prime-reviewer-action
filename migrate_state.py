@@ -12,7 +12,13 @@ import tarfile
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from state_store import B2StateStore, StorageError, create_trace_bundle, safe_extract_tar
+from state_store import (
+    B2StateStore,
+    StorageError,
+    create_trace_bundle,
+    safe_extract_tar,
+    verify_trace_bundle_payload,
+)
 
 
 def hashes(path):
@@ -49,10 +55,29 @@ def migrate(source, repo, apply=False, refresh_imports=False):
             session = source / 'sessions' / f'pr-{pr}'
         if not session.exists() or not any(session.glob('*.jsonl')):
             raise RuntimeError('Legacy PR session missing; no upload performed')
+
+        # Verify any existing archives against source before reusing a key; fail if they disagree.
+        for meta, path in traces:
+            existing_trace = store._get_object(store.trace_key(meta['run_id']))
+            if existing_trace is not None:
+                subagents = [path / 'subagents'] if (path / 'subagents').exists() else []
+                res = json.loads((path / 'result.json').read_text()) if (path / 'result.json').exists() else None
+                verify_trace_bundle_payload(
+                    existing_trace,
+                    session_file_or_dir=path / 'session.jsonl',
+                    child_dirs=subagents,
+                    result=res,
+                )
+
         if not apply:
             print(f'PR {pr}: ready to import {len(traces)} traces and restore-test its session')
             continue
+
         for meta, path in traces[:-1]:
+            trace_key = store.trace_key(meta['run_id'])
+            if store._get_object(trace_key) is not None:
+                # Existing archive already verified against source; preserve its bytes and manifest provenance
+                continue
             with tempfile.TemporaryDirectory() as tmp:
                 td = Path(tmp)
                 shutil.copy(path / 'session.jsonl', td / 'session.jsonl')
@@ -62,10 +87,10 @@ def migrate(source, repo, apply=False, refresh_imports=False):
                             'legacy_source_commit': commit,
                             'session_lines_before': meta.get('session_lines_before', 0)}
                 bundle = create_trace_bundle(meta, result, td, [path / 'subagents'], manifest)
-                store._client.put_object(Bucket=store.bucket, Key=store.trace_key(meta['run_id']),
+                store._client.put_object(Bucket=store.bucket, Key=trace_key,
                                          Body=bundle, ContentType='application/gzip')
         meta, trace = traces[-1]
-        meta = {**meta, 'legacy_source_commit': commit}
+        meta = {**meta, 'legacy_source_commit': commit, 'source': meta.get('source', 'prime-reviewer-git-import')}
         result = json.loads((trace / 'result.json').read_text()) if (trace / 'result.json').exists() else None
         store.save_state(meta['run_id'], meta, result, session, [trace / 'subagents'],
                          config_commit=meta.get('config_commit', ''),
@@ -75,18 +100,19 @@ def migrate(source, repo, apply=False, refresh_imports=False):
             actual = store.restore_session(restored)
             if hashes(restored) != hashes(session) or actual.get('run_id') != meta['run_id']:
                 raise RuntimeError('Restored session differs from legacy source')
-        # Verify every archived root/child transcript, including older runs.
+        # Verify every archived root/child transcript and structured result, including older runs.
         for record, original in traces:
             data = store._get_object(store.trace_key(record['run_id']))
             if data is None:
                 raise RuntimeError('Uploaded historical trace is missing')
-            with tempfile.TemporaryDirectory() as tmp:
-                dest = Path(tmp)
-                safe_extract_tar(data, dest)
-                if (dest / 'session.jsonl').read_bytes() != (original / 'session.jsonl').read_bytes():
-                    raise RuntimeError('Archived root transcript differs from legacy source')
-                if (original / 'subagents').exists() and hashes(dest / 'subagents') != hashes(original / 'subagents'):
-                    raise RuntimeError('Archived child transcripts differ from legacy source')
+            subagents = [original / 'subagents'] if (original / 'subagents').exists() else []
+            res = json.loads((original / 'result.json').read_text()) if (original / 'result.json').exists() else None
+            verify_trace_bundle_payload(
+                data,
+                session_file_or_dir=original / 'session.jsonl',
+                child_dirs=subagents,
+                result=res,
+            )
         verified += 1
         print(f'PR {pr}: imported and verified session plus {len(traces)} trace bundles')
     return verified

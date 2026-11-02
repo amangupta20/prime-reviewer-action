@@ -87,7 +87,7 @@ class FakeS3Client:
             raise FakeS3ClientError("404", "Not Found", 404)
         return {"ContentLength": len(self.objects[k])}
 
-    def list_objects_v2(self, Bucket: str, Prefix: str = "") -> dict:
+    def list_objects_v2(self, Bucket: str, Prefix: str = "", ContinuationToken: str | None = None, **kwargs) -> dict:
         matching = []
         for (b, k), v in self.objects.items():
             if b == Bucket and k.startswith(Prefix):
@@ -475,6 +475,68 @@ class B2StateStoreTests(unittest.TestCase):
         traces = self.store.list_traces()
         self.assertEqual(len(traces), 2)
         self.assertTrue(all(t.startswith(f"traces/{self.owner}/test-repo/") for t in traces))
+
+    def test_list_traces_follows_continuation_tokens(self):
+        calls = []
+
+        def fake_list_objects_v2(**kwargs):
+            calls.append(dict(kwargs))
+            if "ContinuationToken" not in kwargs:
+                return {
+                    "Contents": [{"Key": f"traces/{self.owner}/test-repo/{self.pr}/run-1.tar.gz"}],
+                    "IsTruncated": True,
+                    "NextContinuationToken": "token-page-2",
+                }
+            elif kwargs["ContinuationToken"] == "token-page-2":
+                return {
+                    "Contents": [{"Key": f"traces/{self.owner}/test-repo/{self.pr}/run-2.tar.gz"}],
+                    "IsTruncated": False,
+                }
+            return {"Contents": [], "IsTruncated": False}
+
+        self.client.list_objects_v2 = fake_list_objects_v2
+        traces = self.store.list_traces()
+        self.assertEqual(
+            traces,
+            [
+                f"traces/{self.owner}/test-repo/{self.pr}/run-1.tar.gz",
+                f"traces/{self.owner}/test-repo/{self.pr}/run-2.tar.gz",
+            ],
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("ContinuationToken", calls[0])
+        self.assertEqual(calls[1]["ContinuationToken"], "token-page-2")
+
+    def test_save_state_avoids_rewriting_existing_trace_and_session(self):
+        session_dir = self.work / "sess_preserve"
+        session_dir.mkdir()
+        (session_dir / "sess.jsonl").write_text('{"turn": 1}\n')
+
+        # First save
+        meta1 = {"run_id": "run-same", "head_after": "h1"}
+        self.store.save_state("run-same", meta1, None, session_dir, [])
+
+        trace_key = self.store.trace_key("run-same")
+        session_key = self.store.session_key("run-same")
+        trace_bytes_1 = self.client.objects[(self.bucket, trace_key)]
+        session_bytes_1 = self.client.objects[(self.bucket, session_key)]
+        put_count_1 = len(self.client.put_history)
+
+        # Save again with same run_id but updated meta (e.g. refreshed import metadata)
+        meta2 = {"run_id": "run-same", "head_after": "h1", "legacy_source_commit": "new-commit"}
+        self.store.save_state("run-same", meta2, None, session_dir, [])
+
+        # Trace and session bytes must not be rewritten
+        self.assertEqual(self.client.objects[(self.bucket, trace_key)], trace_bytes_1)
+        self.assertEqual(self.client.objects[(self.bucket, session_key)], session_bytes_1)
+
+        # Only latest pointer was written on the second call
+        self.assertEqual(len(self.client.put_history), put_count_1 + 1)
+        self.assertEqual(self.client.put_history[-1], self.store.latest_key)
+
+        # Latest pointer records the new metadata
+        latest = self.store.get_latest_metadata()
+        self.assertEqual(latest.get("legacy_source_commit"), "new-commit")
 
 
 class PrimeReviewB2IntegrationTests(unittest.TestCase):

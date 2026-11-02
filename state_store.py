@@ -6,10 +6,12 @@ Supports safe tar.gz extraction, atomic pointer updates, and isolation across re
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
 import tarfile
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -226,6 +228,73 @@ def create_trace_bundle(
     return buf.getvalue()
 
 
+def verify_trace_bundle_payload(
+    data: bytes,
+    session_file_or_dir: Path,
+    child_dirs: list[Path] | None = None,
+    result: dict | None = None,
+) -> None:
+    """Verify existing archived root/child transcripts and structured result content against expected source.
+
+    Raises RuntimeError if existing archive disagrees with source.
+    Skips import-only / provenance metadata fields when checking source equivalence.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp)
+        safe_extract_tar(data, dest)
+
+        # 1. Root transcript
+        orig_session_bytes = None
+        if session_file_or_dir.is_file():
+            orig_session_bytes = session_file_or_dir.read_bytes()
+        elif session_file_or_dir.is_dir():
+            root_candidates = sorted(session_file_or_dir.glob("*.jsonl"))
+            if root_candidates:
+                orig_session_bytes = root_candidates[0].read_bytes()
+
+        dest_session = dest / "session.jsonl"
+        if orig_session_bytes is not None:
+            if not dest_session.exists() or dest_session.read_bytes() != orig_session_bytes:
+                raise RuntimeError("Archived root transcript differs from legacy source")
+        elif dest_session.exists():
+            raise RuntimeError("Archived root transcript differs from legacy source")
+
+        # 2. Child transcripts
+        dest_subagents = dest / "subagents"
+        dest_child_hashes: dict[str, str] = {}
+        if dest_subagents.is_dir():
+            dest_child_hashes = {
+                str(p.relative_to(dest_subagents)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in dest_subagents.rglob("*")
+                if p.is_file()
+            }
+
+        orig_child_hashes: dict[str, str] = {}
+        if child_dirs:
+            for cdir in child_dirs:
+                if cdir.is_dir():
+                    for sf in sorted(cdir.rglob("*.jsonl")):
+                        rel = sf.relative_to(cdir)
+                        orig_child_hashes[str(rel)] = hashlib.sha256(sf.read_bytes()).hexdigest()
+
+        if dest_child_hashes != orig_child_hashes:
+            raise RuntimeError("Archived child transcripts differ from legacy source")
+
+        # 3. Structured result content
+        dest_result_path = dest / "result.json"
+        if result is not None:
+            if not dest_result_path.exists():
+                raise RuntimeError("Archived structured result differs from legacy source")
+            try:
+                dest_res = json.loads(dest_result_path.read_text("utf-8"))
+                if dest_res != result:
+                    raise RuntimeError("Archived structured result differs from legacy source")
+            except Exception:
+                raise RuntimeError("Archived structured result differs from legacy source")
+        elif dest_result_path.exists():
+            raise RuntimeError("Archived structured result differs from legacy source")
+
+
 class B2StateStore:
     """Manages session persistence and immutable run bundles in B2."""
 
@@ -381,7 +450,7 @@ class B2StateStore:
 
         manifest = {
             "schema_version": 1,
-            "source": "prime-reviewer",
+            "source": meta.get("source", "prime-reviewer"),
             "trace_id": f"{self.owner}/{self.repo_name}#{self.pr}/{run_id}",
             "repo": self.repo,
             "repo_name": self.repo_name,
@@ -393,6 +462,8 @@ class B2StateStore:
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "files": ["manifest.json", "meta.json"],
         }
+        if "legacy_source_commit" in meta:
+            manifest["legacy_source_commit"] = meta["legacy_source_commit"]
         if result is not None:
             manifest["files"].append("result.json")
         if session_dir.is_dir() and any(session_dir.glob("*.jsonl")):
@@ -424,7 +495,7 @@ class B2StateStore:
 
         latest_payload = {
             "schema_version": 1,
-            "source": "prime-reviewer",
+            "source": meta_to_store.get("source", "prime-reviewer"),
             "trace_id": manifest["trace_id"],
             "run_id": run_id,
             "repo": self.repo,
@@ -441,30 +512,43 @@ class B2StateStore:
             "meta": meta_to_store,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        if "legacy_source_commit" in meta_to_store:
+            latest_payload["legacy_source_commit"] = meta_to_store["legacy_source_commit"]
         latest_bytes = json.dumps(latest_payload, indent=2).encode("utf-8")
 
         try:
-            # 1. Upload immutable trace bundle
-            self._client.put_object(
-                Bucket=self.bucket,
-                Key=trace_key,
-                Body=trace_bundle_bytes,
-                ContentType="application/gzip",
-            )
+            # 1. Upload immutable trace bundle (avoid rewriting if it already exists; verify equivalence)
+            existing_trace = self._get_object(trace_key)
+            if existing_trace is not None:
+                verify_trace_bundle_payload(
+                    existing_trace,
+                    session_file_or_dir=session_dir,
+                    child_dirs=child_dirs,
+                    result=result,
+                )
+            else:
+                self._client.put_object(
+                    Bucket=self.bucket,
+                    Key=trace_key,
+                    Body=trace_bundle_bytes,
+                    ContentType="application/gzip",
+                )
 
             # 2. Upload immutable session snapshot and meta alongside it
-            self._client.put_object(
-                Bucket=self.bucket,
-                Key=session_key,
-                Body=session_tar_bytes,
-                ContentType="application/gzip",
-            )
-            self._client.put_object(
-                Bucket=self.bucket,
-                Key=session_meta_key,
-                Body=session_meta_bytes,
-                ContentType="application/json",
-            )
+            if self._get_object(session_key) is None:
+                self._client.put_object(
+                    Bucket=self.bucket,
+                    Key=session_key,
+                    Body=session_tar_bytes,
+                    ContentType="application/gzip",
+                )
+            if self._get_object(session_meta_key) is None:
+                self._client.put_object(
+                    Bucket=self.bucket,
+                    Key=session_meta_key,
+                    Body=session_meta_bytes,
+                    ContentType="application/json",
+                )
 
             # 3. Commit mutable latest pointer (only after 1 & 2 succeed)
             self._client.put_object(
@@ -473,6 +557,8 @@ class B2StateStore:
                 Body=latest_bytes,
                 ContentType="application/json",
             )
+        except (RuntimeError, StorageError):
+            raise
         except Exception as e:
             raise StorageError(f"B2 storage write error: {type(e).__name__}") from None
 
@@ -481,9 +567,24 @@ class B2StateStore:
     def list_traces(self, prefix: str | None = None) -> list[str]:
         """List trace keys under the given prefix or this repo's trace prefix."""
         search_prefix = prefix if prefix is not None else f"traces/{self.owner}/{self.repo_name}/"
+        keys: list[str] = []
+        continuation_token: str | None = None
         try:
-            resp = self._client.list_objects_v2(Bucket=self.bucket, Prefix=search_prefix)
-            contents = resp.get("Contents", [])
-            return [obj["Key"] for obj in contents if "Key" in obj]
+            while True:
+                kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": search_prefix}
+                if continuation_token:
+                    kwargs["ContinuationToken"] = continuation_token
+                resp = self._client.list_objects_v2(**kwargs)
+                contents = resp.get("Contents", [])
+                for obj in contents:
+                    if "Key" in obj:
+                        keys.append(obj["Key"])
+                if resp.get("IsTruncated"):
+                    continuation_token = resp.get("NextContinuationToken")
+                    if not continuation_token:
+                        break
+                else:
+                    break
+            return keys
         except Exception as e:
             raise StorageError(f"B2 storage list error: {type(e).__name__}") from None
