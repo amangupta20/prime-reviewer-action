@@ -54,3 +54,9 @@ jobs:
           app-id: ${{ vars.PRIME_APP_ID }}
           app-private-key: ${{ secrets.PRIME_APP_PRIVATE_KEY }}
           opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          state-backend: b2
+          b2-endpoint-url: ${{ secrets.PRIME_B2_ENDPOINT_URL }}
+          b2-bucket: ${{ secrets.PRIME_B2_BUCKET }}
+          b2-region: ${{ secrets.PRIME_B2_REGION }}
+          b2-access-key-id: ${{ secrets.PRIME_B2_ACCESS_KEY_ID }}
+          b2-secret-access-key: ${{ secrets.PRIME_B2_SECRET_ACCESS_KEY }}

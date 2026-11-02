@@ -20,7 +20,7 @@ def hashes(path):
             for p in path.rglob('*') if p.is_file()}
 
 
-def migrate(source, repo, apply=False):
+def migrate(source, repo, apply=False, refresh_imports=False):
     """Return verified PR count. --apply writes additive objects and latest pointers."""
     commit = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
     if subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain'], text=True).strip():
@@ -42,7 +42,7 @@ def migrate(source, repo, apply=False):
         env = {**os.environ, 'OWNER': owner, 'REPO': repo, 'PR_NUMBER': pr}
         store = B2StateStore.from_env(env)
         existing = store.get_latest_metadata()
-        if existing and existing.get('legacy_source_commit') != commit:
+        if existing and existing.get('legacy_source_commit') != commit and not (refresh_imports and existing.get('legacy_source_commit')):
             raise RuntimeError('Destination already has different state; refusing to overwrite')
         session = source / 'sessions' / name / f'pr-{pr}'
         if not session.exists() and name == 'homelab':
@@ -97,8 +97,9 @@ def main():
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--repo', required=True)
     parser.add_argument('--apply', action='store_true', help='Upload and restore-test; default is read-only preflight')
+    parser.add_argument('--refresh-imports', action='store_true', help='Refresh imported state only; never overwrite a native B2 review')
     args = parser.parse_args()
-    migrate(args.source, args.repo, args.apply)
+    migrate(args.source, args.repo, args.apply, args.refresh_imports)
 
 
 if __name__ == '__main__':

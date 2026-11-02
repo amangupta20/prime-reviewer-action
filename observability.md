@@ -12,7 +12,8 @@ transcript and any subagent transcripts. Metadata identifies repository, PR,
 run and model, configured and resolved private config revision, Prime version,
 start time, duration, result, usage and the number of root-session lines that
 already existed before this run. A schema version identifies the archive
-format. The storage implementation and its tests define the object layout.
+format. Older imported runs retain unknown provenance as missing fields;
+we do not invent the config revision that produced them. The storage implementation and its tests define the object layout.
 
 Full raw records remain the source for replay. They are not OTLP messages.
 Session archives support continuation; immutable per-run archives support
