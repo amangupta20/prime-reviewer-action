@@ -40,6 +40,13 @@ import time
 import tomllib
 from pathlib import Path
 
+# Add script directory to sys.path so python3 -I isolation finds sibling modules
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import state_store
+
 WORK = Path.cwd()
 RULES = WORK / "rules"
 AGENT = WORK / "agent"
@@ -60,6 +67,27 @@ RUN_ID = os.environ["RUN_ID"]
 RUN_URL = os.environ["RUN_URL"]
 EVENT = os.environ["EVENT_NAME"]
 TOKEN = os.environ["GH_TOKEN"]
+
+STATE_BACKEND = os.environ.get("STATE_BACKEND", "auto").strip().lower()
+if STATE_BACKEND == "b2":
+    if not state_store.is_b2_configured():
+        state_store.validate_b2_config()
+    B2_MODE = True
+elif STATE_BACKEND == "git":
+    B2_MODE = False
+else:  # auto
+    B2_MODE = state_store.is_b2_configured()
+
+B2_STORE: state_store.B2StateStore | None = None
+
+
+def get_b2_store() -> state_store.B2StateStore | None:
+    global B2_STORE
+    if B2_STORE is not None:
+        return B2_STORE
+    if B2_MODE:
+        B2_STORE = state_store.B2StateStore.from_env()
+    return B2_STORE
 
 
 def load_config() -> dict:
@@ -154,12 +182,14 @@ def saved_session() -> Path:
     return path
 
 
-def parse_mode() -> tuple[str, str, str]:
+def parse_mode(has_saved: bool | None = None) -> tuple[str, str, str]:
     """Return (mode, instruction, focus)."""
+    if has_saved is None:
+        has_saved = saved_session().exists() and any(saved_session().glob("*.jsonl"))
     if GATE:
         if SENDER == f"{os.environ['APP_SLUG']}[bot]":
             return "carry", "", ""
-        if ACTION == "opened" or not saved_session().exists():
+        if ACTION == "opened" or not has_saved:
             focus = "\n".join(
                 l[len("/prime"):].strip() for l in os.environ.get("PR_BODY", "").splitlines()
                 if l.startswith("/prime")
@@ -178,6 +208,10 @@ def parse_mode() -> tuple[str, str, str]:
             parent = gh_api(f"repos/{REPO}/pulls/comments/{reply_to}", check=False) or {}
             ctx += f", replying to this comment:\n{parent.get('body', '')[:3000]}\n"
         text = ctx + ")\n\n" + text
+    if not has_saved:
+        raise state_store.SessionNotFoundError(
+            f"Instruct mode requires an existing saved session for PR #{PR}, but none was found."
+        )
     return "instruct", text, ""
 
 
@@ -204,6 +238,12 @@ def checkout_pr() -> dict:
 
 
 def checkout_state() -> None:
+    if B2_MODE:
+        log("using B2 storage backend; skipping git state clone")
+        if (AGENT / ".git").exists():
+            git(["config", "user.name", f"{os.environ['APP_SLUG']}[bot]"], AGENT)
+            git(["config", "user.email", f"{os.environ['APP_SLUG']}[bot]@users.noreply.github.com"], AGENT)
+        return
     url = f"https://github.com/{CONFIG_REPO}.git"
     r = run(["git", "-c", auth_header(), "clone", "--quiet", "--depth", "1",
              "--branch", "state", url, str(STATE)], check=False)
@@ -246,14 +286,19 @@ Written only by the prime-reviewer action (`amangupta20/prime-reviewer-action`),
 # ------------------------------------------------------------------ run ----
 
 def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
-    if SESSION.exists():
-        shutil.rmtree(SESSION)
-    saved = saved_session()
-    resume = saved.exists() and any(saved.glob("*.jsonl"))
-    if resume:
-        shutil.copytree(saved, SESSION)
+    if not B2_MODE:
+        if SESSION.exists():
+            shutil.rmtree(SESSION)
+        saved = saved_session()
+        resume = saved.exists() and any(saved.glob("*.jsonl"))
+        if resume:
+            shutil.copytree(saved, SESSION)
+        else:
+            SESSION.mkdir(parents=True)
     else:
-        SESSION.mkdir(parents=True)
+        resume = SESSION.is_dir() and any(SESSION.glob("*.jsonl"))
+        if not SESSION.exists():
+            SESSION.mkdir(parents=True)
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "result.json").unlink(missing_ok=True)
 
@@ -576,6 +621,21 @@ def usage_since(lines_before: int) -> dict:
 
 
 def save_state(meta: dict, res: dict) -> None:
+    if B2_MODE:
+        store = get_b2_store()
+        if not store:
+            raise state_store.StorageError("B2 store uninitialized")
+        store.save_state(
+            run_id=RUN_ID,
+            meta=meta,
+            result=res.get("result"),
+            session_dir=SESSION,
+            child_dirs=child_dirs(),
+            config_commit=meta.get("config_commit", ""),
+            session_lines_before=res.get("lines_before", 0),
+        )
+        return
+
     saved = STATE / "sessions" / REPO_NAME / f"pr-{PR}"
     if saved.exists():
         shutil.rmtree(saved)
@@ -602,7 +662,7 @@ def save_state(meta: dict, res: dict) -> None:
             return
         git(["pull", "--quiet", "--rebase", "origin", "state"], STATE, auth=True, check=False)
         time.sleep(2 + attempt * 3)
-    log("could not save state after retries")
+    raise RuntimeError("could not save state after retries")
 
 
 def propose_learning() -> str:
@@ -657,6 +717,12 @@ def write_summary(meta: dict) -> None:
     if not SUMMARY:
         return
     u = meta.get("usage") or {}
+    store = get_b2_store() if B2_MODE else None
+    trace_label = (
+        f"b2:{store.bucket}/{store.trace_key(RUN_ID)}"
+        if B2_MODE and store
+        else f"state:traces/{RUN_ID}/"
+    )
     rows = [
         ("Mode", meta.get("mode")), ("Verdict", meta.get("verdict")),
         ("Blocking findings", len(meta.get("gate_blockers") or [])),
@@ -666,7 +732,7 @@ def write_summary(meta: dict) -> None:
         ("Tokens in / out / cache read",
          f"{u.get('input', 0):,} / {u.get('output', 0):,} / {u.get('cache_read', 0):,}"),
         ("Cost (Prime's estimate)", f"${u.get('cost', 0):.4f}"),
-        ("Model", meta.get("model")), ("Trace", f"`state:traces/{RUN_ID}/`"),
+        ("Model", meta.get("model")), ("Trace", f"`{trace_label}`"),
     ]
     if meta.get("push_note"):
         rows.append(("Not pushed", meta["push_note"]))
@@ -681,35 +747,76 @@ def main() -> int:
     if GATE and os.environ.get("PR_AUTHOR") != OWNER:
         log("not reviewed: only the owner's pull requests are; the owner reviews this one by hand")
         return 1
+
     checkout_state()
-    mode, instruction, focus = parse_mode()
+
+    latest_meta = None
+    if B2_MODE:
+        store = get_b2_store()
+        if SESSION.exists():
+            shutil.rmtree(SESSION)
+        latest_meta = store.restore_session(SESSION) if store else None
+
+    has_saved = (
+        (latest_meta is not None and SESSION.is_dir() and any(SESSION.glob("*.jsonl")))
+        if B2_MODE
+        else (saved_session().exists() and any(saved_session().glob("*.jsonl")))
+    )
+
+    mode, instruction, focus = parse_mode(has_saved=has_saved)
     log(f"mode: {mode} ({EVENT} {ACTION})")
     react("eyes")
 
     if mode == "carry":
         head = os.environ.get("HEAD_SHA", "")
-        prior = [m for m in pr_traces() if m.get("head_after") == head]
-        if prior:
-            blockers = prior[-1].get("gate_blockers") or []
-            log(f"commit {head[:7]} was pushed by the reviewer in run {prior[-1]['run_id']}: "
-                f"reusing its verdict ({len(blockers)} blocking)")
-            for b in blockers:
-                log(f"blocking: section {b.get('section')} {b.get('path')}:{b.get('line')} {b.get('title')}")
-            return 1 if blockers else 0
-        log("no earlier run produced this commit: reviewing the update instead")
-        mode = "update"
+        if B2_MODE:
+            if latest_meta and latest_meta.get("head_after") == head:
+                blockers = latest_meta.get("gate_blockers") or []
+                prior_run = latest_meta.get("run_id", "prior")
+                log(f"commit {head[:7]} was pushed by the reviewer in run {prior_run}: "
+                    f"reusing its verdict ({len(blockers)} blocking)")
+                for b in blockers:
+                    log(f"blocking: section {b.get('section')} {b.get('path')}:{b.get('line')} {b.get('title')}")
+                return 1 if blockers else 0
+            log("no earlier run produced this commit: reviewing the update instead")
+            mode = "update"
+        else:
+            prior = [m for m in pr_traces() if m.get("head_after") == head]
+            if prior:
+                blockers = prior[-1].get("gate_blockers") or []
+                log(f"commit {head[:7]} was pushed by the reviewer in run {prior[-1]['run_id']}: "
+                    f"reusing its verdict ({len(blockers)} blocking)")
+                for b in blockers:
+                    log(f"blocking: section {b.get('section')} {b.get('path')}:{b.get('line')} {b.get('title')}")
+                return 1 if blockers else 0
+            log("no earlier run produced this commit: reviewing the update instead")
+            mode = "update"
 
     ctx = checkout_pr()
-    traces = pr_traces()
-    ctx["last"] = traces[-1]["head_after"] if traces else None
-    git(["remote", "set-url", "origin", f"https://github.com/{CONFIG_REPO}.git"], AGENT)
+    if B2_MODE:
+        ctx["last"] = latest_meta.get("head_after") if latest_meta else None
+    else:
+        traces = pr_traces()
+        ctx["last"] = traces[-1]["head_after"] if traces else None
+
+    if not B2_MODE:
+        git(["remote", "set-url", "origin", f"https://github.com/{CONFIG_REPO}.git"], AGENT)
+
     res = run_prime(ctx, mode, instruction, focus)
     res["mode"] = mode
     result = res["result"] or {}
     blockers = gate_blockers(res["result"])
+
+    config_commit = ""
+    if (AGENT / ".git").exists():
+        try:
+            config_commit = git(["rev-parse", "HEAD"], AGENT).stdout.strip()
+        except Exception:
+            config_commit = ""
+
     meta = {
         "run_id": RUN_ID, "run_url": RUN_URL, "repo": REPO, "pr": int(PR), "mode": mode,
-        "config_ref": CONFIG_REF,
+        "config_ref": CONFIG_REF, "config_commit": config_commit,
         "event": EVENT, "action": ACTION, "model": MODEL,
         "prime_version": os.environ.get("PRIME_AGENT_VERSION"),
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(res["started"])),
