@@ -1,0 +1,150 @@
+name: Prime reviewer
+description: >-
+  Runs Prime Agent on the owner's pull requests: pushes mechanical fixes,
+  posts one-click suggestions, raises design issues, and answers /prime
+  comments. Per-repository settings and the agent's prompts live in a
+  private config repo.
+
+inputs:
+  app-id:
+    description: The reviewer GitHub App's ID.
+    required: true
+  app-private-key:
+    description: The reviewer GitHub App's private key.
+    required: true
+  opencode-api-key:
+    description: Model provider key (OpenCode Go).
+    required: true
+  config-repo:
+    description: Private config repo, owner/name. Default <owner>/prime-reviewer.
+    required: false
+    default: ""
+  config-ref:
+    description: Branch of the config repo to use, for trying a prompt change on one repo.
+    required: false
+    default: main
+  prime-version:
+    description: Prime Agent version, pinned.
+    required: false
+    default: "0.10.2"
+  model:
+    description: Overrides the model in the repo's config.toml.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Keep this step first. The job holds a model key and a token that can
+    # push, and the agent runs commands in the pull request's checkout, so
+    # nothing may happen for a pull request or comment that is not the
+    # owner's. On the gate event it fails, so the required check is red, not
+    # skipped (a skipped required check counts as passing).
+    - name: Only the owner's pull requests and comments
+      shell: bash
+      env:
+        PR_AUTHOR: ${{ github.event.pull_request.user.login || github.event.issue.user.login }}
+        COMMENTER: ${{ github.event.comment.user.login }}
+        HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        OWNER: ${{ github.repository_owner }}
+        REPO: ${{ github.repository }}
+      run: |
+        if [ "$PR_AUTHOR" != "$OWNER" ] \
+          || { [ -n "$COMMENTER" ] && [ "$COMMENTER" != "$OWNER" ]; } \
+          || { [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$REPO" ]; }; then
+          echo "Not reviewed: the Prime reviewer only runs on the owner's own pull requests and comments. The owner reviews this one by hand."
+          exit 1
+        fi
+
+    - name: Config repo name
+      id: cfg
+      shell: bash
+      env:
+        CONFIG_REPO: ${{ inputs.config-repo }}
+        OWNER: ${{ github.repository_owner }}
+      run: |
+        repo="${CONFIG_REPO:-$OWNER/prime-reviewer}"
+        if [ "${repo%/*}" != "$OWNER" ]; then
+          echo "Config repo must belong to the caller repository owner."
+          exit 1
+        fi
+        echo "full=$repo" >> "$GITHUB_OUTPUT"
+        echo "name=${repo#*/}" >> "$GITHUB_OUTPUT"
+
+    - name: App token
+      id: app
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+        repositories: ${{ github.event.repository.name }},${{ steps.cfg.outputs.name }}
+
+    - name: Rules from the default branch
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.repository.default_branch }}
+        path: rules
+        persist-credentials: false
+
+    - name: Reviewer config (private)
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ steps.cfg.outputs.full }}
+        ref: ${{ inputs.config-ref }}
+        token: ${{ steps.app.outputs.token }}
+        path: agent
+        persist-credentials: false
+
+    - name: Cache Prime Agent
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.local/share/prime-agent
+          ~/.local/bin/prime-agent
+          ~/.local/bin/uv
+          ~/.local/bin/uvx
+          ~/.prime/agent/kernel-venv
+          ~/.local/share/uv
+        key: prime-agent-${{ runner.os }}-${{ inputs.prime-version }}-v1
+
+    - name: Install Prime Agent
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        DO_NOT_TRACK: "1"
+        PRIME_AGENT_VERSION: ${{ inputs.prime-version }}
+      run: |
+        curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh -o "$RUNNER_TEMP/install.sh"
+        sh "$RUNNER_TEMP/install.sh"
+        ~/.local/bin/prime-agent --version
+
+    # Event text (comments, the PR body) reaches the script through the
+    # environment, never pasted into a shell line.
+    - name: Run the reviewer
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app.outputs.token }}
+        APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        OPENCODE_API_KEY: ${{ inputs.opencode-api-key }}
+        CONFIG_REPO: ${{ steps.cfg.outputs.full }}
+        CONFIG_REF: ${{ inputs.config-ref }}
+        PRIME_AGENT_VERSION: ${{ inputs.prime-version }}
+        PRIME_MODEL: ${{ inputs.model }}
+        PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        REPO: ${{ github.repository }}
+        OWNER: ${{ github.repository_owner }}
+        EVENT_NAME: ${{ github.event_name }}
+        EVENT_ACTION: ${{ github.event.action }}
+        SENDER: ${{ github.event.sender.login }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login || github.event.issue.user.login }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        COMMENT_ID: ${{ github.event.comment.id }}
+        COMMENT_BODY: ${{ github.event.comment.body }}
+        COMMENT_PATH: ${{ github.event.comment.path }}
+        COMMENT_LINE: ${{ github.event.comment.line }}
+        COMMENT_REPLY_TO: ${{ github.event.comment.in_reply_to_id }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+        RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: python3 -I "$GITHUB_ACTION_PATH/prime-review.py"
