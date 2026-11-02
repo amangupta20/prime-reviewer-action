@@ -56,6 +56,21 @@ fix_check = ""
         return subprocess.run(['git', *args], cwd=self.agent, check=True,
                               capture_output=True, text=True).stdout.strip()
 
+    def test_import_cannot_resume_after_a_later_legacy_write(self):
+        fn = self.mod['verify_legacy_snapshot']
+        calls = []
+        def api(*args, **kwargs):
+            calls.append(args)
+            return {'object': {'sha': 'final-snapshot'}}
+        with patch.dict(fn.__globals__, gh_api=api):
+            fn(None)
+            fn({'run_id': 'native-b2-run'})
+            self.assertEqual(calls, [])
+            fn({'legacy_source_commit': 'final-snapshot'})
+            self.assertEqual(len(calls), 1)
+            with self.assertRaisesRegex(self.mod['state_store'].StorageError, 'Legacy state changed'):
+                fn({'legacy_source_commit': 'older-snapshot'})
+
     def test_legacy_session_restores_only_for_homelab(self):
         legacy = self.work / 'state/sessions/pr-7'
         legacy.mkdir(parents=True)

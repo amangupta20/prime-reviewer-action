@@ -100,3 +100,9 @@ Example (replace paths; UNTESTED until deployment verification):
 python3 -I migrate_state.py --source /path/to/state-checkout --repo owner/repo
 python3 -I migrate_state.py --source /path/to/state-checkout --repo owner/repo --apply
 ```
+
+Before the first B2 use of an imported conversation, the wrapper compares
+its recorded legacy source commit with the private Git state branch. A newer
+legacy write fails explicitly and requires a migration refresh. Native B2
+reviews no longer depend on that Git branch. This protects replies added
+between the final import and the caller merge.

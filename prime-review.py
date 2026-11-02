@@ -751,6 +751,17 @@ def write_summary(meta: dict) -> None:
         f.writelines(f"| {k} | {v} |\n" for k, v in rows)
 
 
+def verify_legacy_snapshot(meta: dict | None) -> None:
+    """An imported conversation must include the last legacy writer before cutover."""
+    expected = (meta or {}).get("legacy_source_commit")
+    if not expected:
+        return
+    current = gh_api(f"repos/{CONFIG_REPO}/git/ref/heads/state")
+    if (current or {}).get("object", {}).get("sha") != expected:
+        raise state_store.StorageError(
+            "Legacy state changed after import; refresh the B2 migration before continuing")
+
+
 def main() -> int:
     if GATE and os.environ.get("PR_AUTHOR") != OWNER:
         log("not reviewed: only the owner's pull requests are; the owner reviews this one by hand")
@@ -764,6 +775,7 @@ def main() -> int:
         if SESSION.exists():
             shutil.rmtree(SESSION)
         latest_meta = store.restore_session(SESSION) if store else None
+        verify_legacy_snapshot(latest_meta)
 
     has_saved = (
         (latest_meta is not None and SESSION.is_dir() and any(SESSION.glob("*.jsonl")))
