@@ -12,10 +12,12 @@ Steps:
    (`/prime <anything else>`).
 2. Check out the PR head, restore this PR's saved session from the private
    repo's `state` branch.
-3. Run Prime with a scrubbed environment: it gets the model key and its
-   inputs, never the GitHub token.
-4. Check the commits it made (allowed paths, the configured check from the default branch)
-   and push them with the App token.
+3. Run Prime as its own Linux user on fresh copies of the PR, rules,
+   config and session: it gets the model key and its inputs, never the
+   GitHub token or storage keys, and cannot change files this script trusts.
+4. Take its commits back as a bundle, check them (allowed paths, the
+   configured check from the default branch, run as Prime's user) and push
+   them with the App token.
 5. Post a review: suggestions and design comments on diff lines, the rest in
    the summary. In instruct mode, reply to the comment.
 6. Save the session and a per-run trace to the `state` branch, and propose
@@ -45,6 +47,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+# action.yml installs boto3 with pip --target; -I ignores PYTHONPATH and the
+# user's site-packages, so the folder is added here.
+if os.environ.get("PRIME_PYLIB"):
+    sys.path.insert(0, os.environ["PRIME_PYLIB"])
+
 import state_store
 
 WORK = Path.cwd()
@@ -53,9 +60,17 @@ AGENT = WORK / "agent"
 PR_DIR = WORK / "pr"
 STATE = WORK / "state"
 TMP = Path(os.environ.get("RUNNER_TEMP", "/tmp"))
-OUT = TMP / "prime-out"
 SESSION = TMP / "prime-session"
-PRIME = Path.home() / ".local/bin/prime-agent"
+
+# Prime runs as its own Linux user (installed by action.yml), so it cannot
+# read this process's credentials or change any file this wrapper later
+# trusts. Everything it may read or change is a fresh copy under JAIL.
+PRIME_USER = os.environ.get("PRIME_USER", "prime-runner")
+PRIME_HOME = Path(f"/home/{PRIME_USER}")
+PRIME = PRIME_HOME / ".local/bin/prime-agent"
+PRIME_PATH = f"{PRIME_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+JAIL = Path(os.environ.get("PRIME_JAIL", "/srv/prime-review"))
+OUT = JAIL / "out"
 
 REPO = os.environ["REPO"]
 REPO_NAME = REPO.split("/", 1)[1]
@@ -86,6 +101,11 @@ else:  # auto
     else:
         B2_MODE = False
 
+# Credentials leave the process environment once read, so no command this
+# wrapper starts inherits them; each call that needs one is given it.
+SECRETS = {k: os.environ.pop(k) for k in ("GH_TOKEN", "OPENCODE_API_KEY", *state_store.B2_ENV_VARS)
+           if k in os.environ}
+
 B2_STORE: state_store.B2StateStore | None = None
 
 
@@ -94,7 +114,7 @@ def get_b2_store() -> state_store.B2StateStore | None:
     if B2_STORE is not None:
         return B2_STORE
     if B2_MODE:
-        B2_STORE = state_store.B2StateStore.from_env()
+        B2_STORE = state_store.B2StateStore.from_env({**os.environ, **SECRETS})
     return B2_STORE
 
 
@@ -153,22 +173,87 @@ def run(cmd, cwd=None, check=True, env=None, capture=True, input_=None):
     return r
 
 
+def gh_env() -> dict:
+    """The environment for `gh`: the only commands given the App token."""
+    return {**os.environ, "GH_TOKEN": TOKEN}
+
+
 def gh_api(path: str, method: str = "GET", body: dict | None = None, check=True):
     cmd = ["gh", "api", "-X", method, path]
     if body is not None:
         cmd += ["--input", "-"]
-    r = run(cmd, check=check, input_=json.dumps(body) if body is not None else None)
+    r = run(cmd, check=check, env=gh_env(),
+            input_=json.dumps(body) if body is not None else None)
     return json.loads(r.stdout) if r.stdout.strip() else None
 
 
-def auth_header() -> str:
+def sudo(args: list[str], check=True):
+    return run(["sudo", "-n", *args], check=check)
+
+
+def as_prime(args: list[str], chdir: Path | None = None, env: dict | None = None,
+             check=True):
+    """Run a command as PRIME_USER with a minimal environment and no credentials."""
+    base = {"PATH": PRIME_PATH, "HOME": str(PRIME_HOME), "LANG": "C.UTF-8",
+            "TMPDIR": str(JAIL / "tmp"), "DO_NOT_TRACK": "1"}
+    pairs = [f"{k}={v}" for k, v in {**base, **(env or {})}.items()]
+    where = [f"--chdir={chdir}"] if chdir else []
+    return sudo(["-u", PRIME_USER, "--", "/usr/bin/env", "-i", *where, *pairs, *args],
+                check=check)
+
+
+def stop_prime_processes() -> None:
+    """Kill everything PRIME_USER still runs, so nothing changes its files or
+    watches this wrapper while it collects them and pushes."""
+    for _ in range(20):
+        sudo(["pkill", "-KILL", "-u", PRIME_USER], check=False)
+        if sudo(["pgrep", "-u", PRIME_USER], check=False).returncode == 1:
+            return
+        time.sleep(0.25)
+    raise RuntimeError("the reviewer's processes did not stop")
+
+
+def give_to_prime(*paths: Path) -> None:
+    for p in paths:
+        sudo(["chown", "-R", "-h", f"{PRIME_USER}:{PRIME_USER}", str(p)])
+
+
+def take_from_prime() -> None:
+    """Own the jail again (-h: change symlinks themselves, never their targets)."""
+    sudo(["chown", "-R", "-h", f"{os.getuid()}:{os.getgid()}", str(JAIL)])
+
+
+def copy_regular(src: Path, dst: Path) -> None:
+    """Copy only regular files: Prime's output may hold symlinks that point at
+    this user's files."""
+    if src.is_symlink() or not src.is_dir():
+        return
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+        for name in files:
+            p = Path(root) / name
+            if p.is_symlink() or not p.is_file():
+                continue
+            target = dst / p.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(p, target)
+
+
+def regular_file(p: Path) -> bool:
+    return not p.is_symlink() and p.is_file()
+
+
+def auth_env() -> dict:
+    """The App token for git, in the environment: a command line is readable
+    by every local user, including the one Prime runs as."""
     b = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
-    return f"http.https://github.com/.extraheader=AUTHORIZATION: basic {b}"
+    return {**os.environ, "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+            "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {b}"}
 
 
 def git(args, cwd, auth=False, check=True):
-    cmd = ["git"] + (["-c", auth_header()] if auth else []) + args
-    return run(cmd, cwd=cwd, check=check)
+    return run(["git"] + args, cwd=cwd, check=check, env=auth_env() if auth else None)
 
 
 def react(content: str) -> None:
@@ -233,8 +318,9 @@ def checkout_pr() -> dict:
         log("pull request is not open: fixes will not be pushed")
     if PR_DIR.exists():
         shutil.rmtree(PR_DIR)
-    run(["git", "-c", auth_header(), "clone", "--quiet", "--no-tags",
-         "--branch", pr["head"]["ref"], f"https://github.com/{REPO}.git", str(PR_DIR)])
+    run(["git", "clone", "--quiet", "--no-tags",
+         "--branch", pr["head"]["ref"], f"https://github.com/{REPO}.git", str(PR_DIR)],
+        env=auth_env())
     git(["fetch", "--quiet", "origin", pr["base"]["ref"]], PR_DIR)
     base = git(["merge-base", "HEAD", f"origin/{pr['base']['ref']}"], PR_DIR).stdout.strip()
     head = git(["rev-parse", "HEAD"], PR_DIR).stdout.strip()
@@ -253,8 +339,8 @@ def checkout_state() -> None:
             git(["config", "user.email", f"{os.environ['APP_SLUG']}[bot]@users.noreply.github.com"], AGENT)
         return
     url = f"https://github.com/{CONFIG_REPO}.git"
-    r = run(["git", "-c", auth_header(), "clone", "--quiet", "--depth", "1",
-             "--branch", "state", url, str(STATE)], check=False)
+    r = run(["git", "clone", "--quiet", "--depth", "1",
+             "--branch", "state", url, str(STATE)], check=False, env=auth_env())
     if r.returncode != 0:
         log("no state branch yet: starting one")
         STATE.mkdir(parents=True, exist_ok=True)
@@ -307,25 +393,18 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
         resume = SESSION.is_dir() and any(SESSION.glob("*.jsonl"))
         if not SESSION.exists():
             SESSION.mkdir(parents=True)
-    OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / "result.json").unlink(missing_ok=True)
-
     session_file = next(iter(sorted(SESSION.glob("*.jsonl"))), None)
     lines_before = sum(1 for _ in open(session_file)) if session_file else 0
 
+    prepare_jail()
+    playbook = JAIL / "agent" / PLAYBOOK.relative_to(AGENT)
     env = {
-        "PATH": f"{Path.home()}/.local/bin:/usr/local/bin:/usr/bin:/bin",
-        "HOME": str(Path.home()),
-        "USER": os.environ.get("USER", "runner"),
-        "LANG": "C.UTF-8",
+        "USER": PRIME_USER,
         "TERM": "dumb",
-        "TMPDIR": str(TMP),
-        "DO_NOT_TRACK": "1",
-        "OPENCODE_API_KEY": os.environ["OPENCODE_API_KEY"],
-        "PRIME_AGENT_CODING_AGENT_DIR": str(AGENT),
+        "PRIME_AGENT_CODING_AGENT_DIR": str(JAIL / "agent"),
         "BASE": ctx["base"],
         "HEAD": ctx["head"],
-        "RULES_DIR": str(RULES),
+        "RULES_DIR": str(JAIL / "rules"),
         "PRIME_OUT": str(OUT),
         "PRIME_MODE": mode,
         "PRIME_INSTRUCTION": instruction,
@@ -334,7 +413,7 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
         "PRIME_RULES": " ".join(CONFIG.get("rules", ["AGENTS.md"])),
         "PRIME_PROTECTED": " ".join(CONFIG.get("protected", [])),
         "PRIME_FIX_CHECK": CONFIG.get("fix_check", ""),
-        "PRIME_PLAYBOOK": str(PLAYBOOK),
+        "PRIME_PLAYBOOK": str(playbook),
         "PRIME_REPO": REPO,
     }
     if mode == "review":
@@ -353,16 +432,26 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
                   "$PRIME_INSTRUCTION. Do it under your core's rules (the PR's state may "
                   "have changed since your last run: re-read what you need), and write "
                   "$PRIME_OUT/result.json with the reply filled in.")
-    cmd = [str(PRIME), "-p", "--mode", "json", "--session-dir", str(SESSION),
+    cmd = [str(PRIME), "-p", "--mode", "json", "--session-dir", str(JAIL / "session"),
            "--provider", "opencode-go", "--model", MODEL, "--thinking", "high",
-           "--skill", str(PLAYBOOK)]
+           "--skill", str(playbook)]
     if resume:
         cmd.append("-c")
     cmd.append(prompt)
+    # The model key is the one credential Prime gets. It travels through
+    # sudo's preserved environment, never the command line, which any local
+    # user can read; the other values are not secret.
+    base = {"PATH": PRIME_PATH, "HOME": str(PRIME_HOME), "LANG": "C.UTF-8",
+            "TMPDIR": str(JAIL / "tmp"), "DO_NOT_TRACK": "1"}
+    launch = ["sudo", "-n", "-u", PRIME_USER, "--preserve-env=OPENCODE_API_KEY", "--",
+              "/usr/bin/env", f"--chdir={JAIL / 'work'}",
+              *[f"{k}={v}" for k, v in {**base, **env}.items()], *cmd]
 
     started = time.time()
     log(f"running Prime ({mode}, resume={resume}, model {MODEL})")
-    proc = subprocess.Popen(cmd, cwd=PR_DIR, env=env, text=True, stdin=subprocess.DEVNULL,
+    proc = subprocess.Popen(launch, text=True, stdin=subprocess.DEVNULL,
+                            env={"PATH": "/usr/bin:/bin",
+                                 "OPENCODE_API_KEY": SECRETS.get("OPENCODE_API_KEY", "")},
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=1)
     final_text = stream_progress(proc, started)
     try:
@@ -370,17 +459,85 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
     except subprocess.TimeoutExpired:
         proc.kill()
         code = -9
-    subprocess.run([str(PRIME), "shutdown"], env=env, capture_output=True)
+    as_prime([str(PRIME), "shutdown"], check=False)
     duration = round(time.time() - started)
     log(f"Prime exited {code} after {duration}s")
 
+    prime_head = collect_from_jail(ctx)
     result = None
     try:
+        if not regular_file(OUT / "result.json"):
+            raise OSError("missing")
         result = json.loads((OUT / "result.json").read_text())
+        if not isinstance(result, dict):
+            raise ValueError("not an object")
     except (OSError, ValueError) as e:
+        result = None
         log(f"no usable result.json ({e.__class__.__name__})")
-    return {"result": result, "exit": code, "duration": duration,
+    return {"result": result, "exit": code, "duration": duration, "prime_head": prime_head,
             "started": started, "lines_before": lines_before, "stdout": final_text}
+
+
+def prepare_jail() -> None:
+    """Fresh copies of what Prime may read or change. The rules stay owned by
+    this user, so Prime can read them but not change them."""
+    stop_prime_processes()
+    sudo(["rm", "-rf", "--one-file-system", str(JAIL)])
+    sudo(["install", "-d", "-m", "755", "-o", str(os.getuid()), "-g", str(os.getgid()),
+          str(JAIL)])
+    no_git = shutil.ignore_patterns(".git")
+    shutil.copytree(RULES, JAIL / "rules", ignore=no_git, symlinks=True)
+    shutil.copytree(AGENT, JAIL / "agent", ignore=no_git, symlinks=True)
+    shutil.copytree(SESSION, JAIL / "session", symlinks=True)
+    # --no-hardlinks: Prime will own these objects, and they must not be the
+    # same files as the checkout this wrapper pushes from.
+    git(["clone", "--quiet", "--no-hardlinks", str(PR_DIR), str(JAIL / "work")], WORK)
+    for key in ("user.name", "user.email"):
+        git(["config", key, git(["config", key], PR_DIR).stdout.strip()], JAIL / "work")
+    for d in ("out", "tmp"):
+        (JAIL / d).mkdir()
+    give_to_prime(*(JAIL / d for d in ("agent", "session", "work", "out", "tmp")))
+
+
+def collect_from_jail(ctx: dict) -> str:
+    """Bring back the session, sub-agent transcripts, lesson edits and commits.
+
+    Prime's git repository is only read by git running as PRIME_USER: its
+    config and hooks may have been changed. Its commits come back as a bundle,
+    which git here reads as plain data. Returns Prime's head commit, or "".
+    """
+    stop_prime_processes()
+    work = JAIL / "work"
+    r = as_prime(["git", "-C", str(work), "rev-parse", "HEAD"], check=False)
+    prime_head = r.stdout.strip() if r.returncode == 0 else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", prime_head):
+        prime_head = ""
+    if prime_head and prime_head != ctx["head"]:
+        as_prime(["git", "-C", str(work), "bundle", "create", "--quiet",
+                  str(OUT / "commits.bundle"), "HEAD", f"^{ctx['head']}"], check=False)
+    stop_prime_processes()
+    take_from_prime()
+
+    if SESSION.exists():
+        shutil.rmtree(SESSION)
+    SESSION.mkdir(parents=True)
+    copy_regular(JAIL / "session", SESSION)
+    root = next(iter(sorted(SESSION.glob("*.jsonl"))), None)
+    if root:
+        artifacts = Path("session-artifacts") / root.stem
+        copy_regular(JAIL / "agent" / artifacts, AGENT / artifacts)
+    for rel in lesson_paths():
+        src, dst = JAIL / "agent" / rel, AGENT / rel
+        if regular_file(src):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+    copy_regular(JAIL / "agent" / "harness", AGENT / "harness")
+    return prime_head
+
+
+def lesson_paths() -> list[Path]:
+    """The files Prime may propose changes to (APPEND_SYSTEM.md's rules)."""
+    return [PLAYBOOK.relative_to(AGENT) / "SKILL.md", Path("skills/common-review/SKILL.md")]
 
 
 def describe_code(code: str) -> str:
@@ -446,17 +603,19 @@ def stream_progress(proc, started: float, deadline: int = 2400) -> str:
 
 # -------------------------------------------------------------- commits ----
 
-def check_and_push(ctx: dict) -> tuple[str, list[str], str]:
+def check_and_push(ctx: dict, prime_head: str) -> tuple[str, list[str], str]:
     """Return (new head, list of pushed commit lines, note)."""
-    new_head = git(["rev-parse", "HEAD"], PR_DIR).stdout.strip()
-    if new_head == ctx["head"]:
+    if not prime_head or prime_head == ctx["head"]:
         return ctx["head"], [], ""
+    bundle = OUT / "commits.bundle"
+    if not regular_file(bundle) or git(["fetch", "--quiet", "--no-tags", str(bundle), "HEAD"],
+                                       PR_DIR, check=False).returncode != 0:
+        return ctx["head"], [], "its commits could not be collected; not pushed"
+    new_head = git(["rev-parse", "FETCH_HEAD"], PR_DIR).stdout.strip()
     if git(["merge-base", "--is-ancestor", ctx["head"], new_head], PR_DIR,
            check=False).returncode != 0:
-        git(["reset", "--hard", ctx["head"]], PR_DIR)
         return ctx["head"], [], "the reviewer rewrote history; its commits were dropped"
-    if git(["status", "--porcelain"], PR_DIR).stdout.strip():
-        git(["stash", "--include-untracked"], PR_DIR, check=False)
+    git(["reset", "--quiet", "--hard", new_head], PR_DIR)
     # --no-renames lists both sides of a move, so moving a protected file out
     # of its folder is still caught; -z keeps unusual names unquoted.
     changed = [p for p in git(["diff", "--no-renames", "--name-only", "-z",
@@ -465,12 +624,9 @@ def check_and_push(ctx: dict) -> tuple[str, list[str], str]:
     if bad:
         git(["reset", "--hard", ctx["head"]], PR_DIR)
         return ctx["head"], [], f"its commits touched protected paths ({', '.join(bad)}); not pushed"
-    if CONFIG.get("fix_check"):
-        chk = run(["bash", "-c", CONFIG["fix_check"]], cwd=PR_DIR, check=False,
-                  env={**os.environ, "RULES_DIR": str(RULES)})
-        if chk.returncode != 0:
-            git(["reset", "--hard", ctx["head"]], PR_DIR)
-            return ctx["head"], [], "the repo's check failed after its commits; not pushed"
+    if CONFIG.get("fix_check") and not run_fix_check():
+        git(["reset", "--hard", ctx["head"]], PR_DIR)
+        return ctx["head"], [], "the repo's check failed after its commits; not pushed"
     if ctx["pr"]["state"] != "open":
         git(["reset", "--hard", ctx["head"]], PR_DIR)
         return ctx["head"], [], "the pull request is closed; commits not pushed"
@@ -478,6 +634,21 @@ def check_and_push(ctx: dict) -> tuple[str, list[str], str]:
         PR_DIR, auth=True)
     commits = git(["log", "--format=%h %s", f"{ctx['head']}..{new_head}"], PR_DIR).stdout.splitlines()
     return new_head, commits, ""
+
+
+def run_fix_check() -> bool:
+    """The configured check, as PRIME_USER, on a fresh copy of exactly the
+    commits about to be pushed. It gets no credentials."""
+    check = JAIL / "check"
+    sudo(["rm", "-rf", "--one-file-system", str(check)])
+    git(["clone", "--quiet", "--no-hardlinks", str(PR_DIR), str(check)], WORK)
+    give_to_prime(check, JAIL / "tmp")
+    # The job's PATH, so toolchains set up before the action are found.
+    r = as_prime(["bash", "-c", CONFIG["fix_check"]], chdir=check, check=False,
+                 env={"RULES_DIR": str(JAIL / "rules"), "PATH": os.environ.get("PATH", PRIME_PATH)})
+    stop_prime_processes()
+    take_from_prime()
+    return r.returncode == 0
 
 
 # --------------------------------------------------------------- review ----
@@ -575,7 +746,7 @@ def post_review(ctx: dict, new_head: str, res: dict, commits: list[str], note: s
         return
     review = {"commit_id": new_head, "event": "COMMENT", "body": body, "comments": inline}
     r = run(["gh", "api", "-X", "POST", f"repos/{REPO}/pulls/{PR}/reviews", "--input", "-"],
-            check=False, input_=json.dumps(review))
+            check=False, env=gh_env(), input_=json.dumps(review))
     if r.returncode != 0:
         log("inline review rejected; posting everything as one comment")
         allf = "\n\n".join(f"`{c['path']}:{c['line']}` — {c['body']}" for c in inline)
@@ -855,7 +1026,7 @@ def main() -> int:
     # The trace is saved whatever happens next: a failed run is the one a
     # trace viewer is most needed for.
     try:
-        new_head, commits, note = check_and_push(ctx)
+        new_head, commits, note = check_and_push(ctx, res["prime_head"])
         meta.update(head_after=new_head, fixes_pushed=len(commits), push_note=note)
         learn_url = propose_learning()
         meta["playbook_pr"] = learn_url

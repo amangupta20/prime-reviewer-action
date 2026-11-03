@@ -55,6 +55,21 @@ homelab sessions have a read fallback. Trace metadata includes the full repo,
 config ref, run, usage, result and head commits. Proposed lesson pull requests
 can stage only the current playbook, common-review and harness lessons.
 
+## Isolation
+
+Prime runs as a separate Linux user, `prime-runner`, created by the action.
+It works on fresh copies of the pull request, rules, private config and
+session under `/srv/prime-review`; the rules copy is read-only to it. The
+wrapper keeps the App token and storage keys out of its own environment,
+passes the model key through `sudo`'s preserved environment, and gives git
+the token through the environment rather than the command line. After Prime
+exits, all its processes are killed, its commits come back as a git bundle,
+and only regular files are copied back (session, sub-agent transcripts and
+the lesson files it may edit). The configured check also runs as
+`prime-runner`, on a fresh copy of the commits about to be pushed. Prime is
+installed fresh for that user on every run instead of from a cache.
+UNTESTED on GitHub until the first run of a release that contains it.
+
 ## Validation
 
 Run `python3 -I -m unittest discover -s tests -v` (run locally 2026-11-03).

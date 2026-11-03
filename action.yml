@@ -143,34 +143,30 @@ runs:
         path: agent
         persist-credentials: false
 
-    - name: Cache Prime Agent
-      id: cache
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.local/share/prime-agent
-          ~/.local/bin/prime-agent
-          ~/.local/bin/uv
-          ~/.local/bin/uvx
-          ~/.prime/agent/kernel-venv
-          ~/.local/share/uv
-        key: prime-agent-${{ runner.os }}-${{ inputs.prime-version }}-v1
-
-    - name: Install Prime Agent
-      if: steps.cache.outputs.cache-hit != 'true'
+    # Prime runs as its own user, so it cannot read this job's credentials
+    # (they live in the runner user's processes) or change any file the
+    # reviewer later trusts. It is installed fresh on every run: a cache
+    # saved after a run would hold files Prime could have changed.
+    - name: Install Prime Agent for its own user
       shell: bash
       env:
-        DO_NOT_TRACK: "1"
         PRIME_AGENT_VERSION: ${{ inputs.prime-version }}
       run: |
+        id prime-runner >/dev/null 2>&1 || sudo useradd --create-home --shell /bin/bash prime-runner
         curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh -o "$RUNNER_TEMP/install.sh"
-        sh "$RUNNER_TEMP/install.sh"
-        ~/.local/bin/prime-agent --version
+        sudo install -m 644 "$RUNNER_TEMP/install.sh" /home/prime-runner/install.sh
+        sudo -n -u prime-runner -H /usr/bin/env DO_NOT_TRACK=1 \
+          PRIME_AGENT_VERSION="$PRIME_AGENT_VERSION" sh /home/prime-runner/install.sh
+        sudo -n -u prime-runner -H /home/prime-runner/.local/bin/prime-agent --version
 
     - name: Install object storage client
       if: inputs.b2-bucket != ''
       shell: bash
-      run: python3 -m pip install --disable-pip-version-check 'boto3==1.42.4'
+      # --target: the wrapper runs with python3 -I, which ignores a per-user
+      # install, and the runner's system Python may refuse a global one.
+      run: >-
+        python3 -m pip install --disable-pip-version-check --quiet
+        --target "$RUNNER_TEMP/prime-pylib" 'boto3==1.42.4'
 
     # Event text (comments, the PR body) reaches the script through the
     # environment, never pasted into a shell line.
@@ -206,4 +202,5 @@ runs:
         PR_BODY: ${{ github.event.pull_request.body }}
         RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        PRIME_PYLIB: ${{ runner.temp }}/prime-pylib
       run: python3 -I "$GITHUB_ACTION_PATH/prime-review.py"
