@@ -457,7 +457,10 @@ def check_and_push(ctx: dict) -> tuple[str, list[str], str]:
         return ctx["head"], [], "the reviewer rewrote history; its commits were dropped"
     if git(["status", "--porcelain"], PR_DIR).stdout.strip():
         git(["stash", "--include-untracked"], PR_DIR, check=False)
-    changed = git(["diff", "--name-only", f"{ctx['head']}..{new_head}"], PR_DIR).stdout.split()
+    # --no-renames lists both sides of a move, so moving a protected file out
+    # of its folder is still caught; -z keeps unusual names unquoted.
+    changed = [p for p in git(["diff", "--no-renames", "--name-only", "-z",
+                               f"{ctx['head']}..{new_head}"], PR_DIR).stdout.split("\0") if p]
     bad = [p for p in changed if DENY.match(p)]
     if bad:
         git(["reset", "--hard", ctx["head"]], PR_DIR)
