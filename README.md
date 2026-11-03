@@ -58,6 +58,36 @@ Trace metadata includes the full repo,
 config ref, run, usage, result and head commits. Proposed lesson pull requests
 can stage only the current playbook, common-review and harness lessons.
 
+## Commands
+
+The action parses `/prime` comments on pull requests and review threads:
+
+- `/prime review`: triggers a full review.
+- `/prime review <focus>`: triggers a full review focused on the requested topic (e.g. `/prime review security`).
+- `/prime ask <question>`: read-only question answering. Prime answers without making code changes or pushing commits, and without proposing playbook changes.
+- `/prime fix <instruction>`: implements a requested code fix and pushes checked commits.
+- `/prime <natural instruction>`: backwards-compatible natural instruction.
+
+A strict `/prime` token boundary is enforced: commands like `/primer` are rejected.
+Instruction runs (`ask`, `fix`, `instruct`) continue the PR's saved session and preserve
+existing gate blockers from earlier review runs.
+
+## CI evidence
+
+At run start, the reviewer captures a single exact-head snapshot of GitHub check
+runs and commit statuses for the PR head commit and provides it to Prime as
+bounded, untrusted context:
+
+- Excludes the reviewer action's own checks (`ai review`, `prime`, and App slug).
+- Distinguishes `pass`, `fail`, `pending`, `skipped`, `incomplete`, and `unavailable` states.
+- Aggregate status is computed across all fetched checks before display bounds,
+  ensuring failures are not hidden behind truncation limits.
+- Evaluates endpoint and pagination completeness: partial endpoint failures or unreturned
+  rows mark the snapshot as incomplete and prevent false-pass verdicts.
+- Only check names, types, and states are ingested; arbitrary log output or step summaries
+  are never fetched, avoiding credential exposure.
+- No automatic workflow reruns or polling are triggered.
+
 ## Isolation
 
 Prime runs as a separate Linux user, `prime-runner`, created by the action.

@@ -52,6 +52,8 @@ if str(SCRIPT_DIR) not in sys.path:
 if os.environ.get("PRIME_PYLIB"):
     sys.path.insert(0, os.environ["PRIME_PYLIB"])
 
+import ci_evidence
+import command_routing
 import state_store
 
 WORK = Path.cwd()
@@ -275,37 +277,41 @@ def saved_session() -> Path:
     return path
 
 
-def parse_mode(has_saved: bool | None = None) -> tuple[str, str, str]:
-    """Return (mode, instruction, focus)."""
+def parse_mode(has_saved: bool | None = None) -> tuple[str, str, str, str]:
+    """Return (mode, instruction, focus, command)."""
     if has_saved is None:
         has_saved = saved_session().exists() and any(saved_session().glob("*.jsonl"))
     if GATE:
         if SENDER == f"{os.environ['APP_SLUG']}[bot]":
-            return "carry", "", ""
+            return "carry", "", "", "carry"
         if ACTION == "opened" or not has_saved:
-            focus = "\n".join(
+            raw_focus = "\n".join(
                 l[len("/prime"):].strip() for l in os.environ.get("PR_BODY", "").splitlines()
                 if l.startswith("/prime")
             )
-            return "review", "", focus
-        return "update", "", ""
+            cmd, _, focus_parsed = command_routing.parse_command(raw_focus)
+            effective_focus = focus_parsed or raw_focus
+            return "review", "", effective_focus, "review"
+        return "update", "", "", "update"
     body = os.environ.get("COMMENT_BODY", "")
-    text = body[len("/prime"):].strip()
-    m = re.match(r"(?is)^review\b(.*)$", text)
-    if not text or m:
-        return "review", "", (m.group(1).strip() if m else "")
+    cmd, text, focus = command_routing.parse_command(body)
+    if cmd == "unknown":
+        raise ValueError(f"Unrecognized command: '{body.strip()}' is not a valid /prime command")
+    mode = command_routing.command_to_mode(cmd)
+    if mode == "review":
+        return "review", "", focus, "review"
     if EVENT == "pull_request_review_comment":
         ctx = f"(On {os.environ.get('COMMENT_PATH')} line {os.environ.get('COMMENT_LINE')}"
         reply_to = os.environ.get("COMMENT_REPLY_TO")
         if reply_to:
             parent = gh_api(f"repos/{REPO}/pulls/comments/{reply_to}", check=False) or {}
             ctx += f", replying to this comment:\n{parent.get('body', '')[:3000]}\n"
-        text = ctx + ")\n\n" + text
+        text = f"{ctx})\n\n{text}" if text else f"{ctx})"
     if not has_saved:
         raise state_store.SessionNotFoundError(
             f"Instruct mode requires an existing saved session for PR #{PR}, but none was found."
         )
-    return "instruct", text, ""
+    return mode, text, "", cmd
 
 
 # ------------------------------------------------------------- checkout ----
@@ -379,7 +385,8 @@ Written only by the prime-reviewer action (`amangupta20/prime-reviewer-action`),
 
 # ------------------------------------------------------------------ run ----
 
-def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
+def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
+              command: str = "review", ci_data: dict | None = None) -> dict:
     if not B2_MODE:
         if SESSION.exists():
             shutil.rmtree(SESSION)
@@ -398,6 +405,7 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
 
     prepare_jail()
     playbook = JAIL / "agent" / PLAYBOOK.relative_to(AGENT)
+    ci_context_str = json.dumps(ci_data) if ci_data else "{}"
     env = {
         "USER": PRIME_USER,
         "TERM": "dumb",
@@ -407,6 +415,8 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
         "RULES_DIR": str(JAIL / "rules"),
         "PRIME_OUT": str(OUT),
         "PRIME_MODE": mode,
+        "PRIME_COMMAND": command,
+        "PRIME_CI_CONTEXT": ci_context_str,
         "PRIME_INSTRUCTION": instruction,
         "PRIME_FOCUS": focus,
         "LAST": ctx.get("last") or ctx["base"],
@@ -416,7 +426,16 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
         "PRIME_PLAYBOOK": str(playbook),
         "PRIME_REPO": REPO,
     }
-    if mode == "review":
+    if command == "ask":
+        prompt = (f"The owner asked a question on pull request #{PR}: read it from "
+                  "$PRIME_INSTRUCTION. Answer it as a read-only response under your core's "
+                  "rules without making code changes or commits, and write "
+                  "$PRIME_OUT/result.json with the reply filled in.")
+    elif command == "fix":
+        prompt = (f"The owner requested a fix on pull request #{PR}: read it from "
+                  "$PRIME_INSTRUCTION. Implement the requested fix under your core's rules, "
+                  "and write $PRIME_OUT/result.json with the reply filled in.")
+    elif mode == "review":
         prompt = (f"Review pull request #{PR} (diff $BASE..$HEAD). Follow your core and "
                   "your playbook skill, fix level 1 findings as commits, and write "
                   "$PRIME_OUT/result.json.")
@@ -432,6 +451,10 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
                   "$PRIME_INSTRUCTION. Do it under your core's rules (the PR's state may "
                   "have changed since your last run: re-read what you need), and write "
                   "$PRIME_OUT/result.json with the reply filled in.")
+    if ci_data:
+        ci_summary_text = ci_evidence.format_ci_summary_for_prompt(ci_data)
+        if ci_summary_text:
+            prompt += f"\n\n{ci_summary_text}"
     cmd = [str(PRIME), "-p", "--mode", "json", "--session-dir", str(JAIL / "session"),
            "--provider", "opencode-go", "--model", MODEL, "--thinking", "high",
            "--skill", str(playbook)]
@@ -463,7 +486,7 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str) -> dict:
     duration = round(time.time() - started)
     log(f"Prime exited {code} after {duration}s")
 
-    prime_head = collect_from_jail(ctx)
+    prime_head = collect_from_jail(ctx, command=command)
     result = None
     try:
         if not regular_file(OUT / "result.json"):
@@ -499,7 +522,7 @@ def prepare_jail() -> None:
     give_to_prime(*(JAIL / d for d in ("agent", "session", "work", "out", "tmp")))
 
 
-def collect_from_jail(ctx: dict) -> str:
+def collect_from_jail(ctx: dict, command: str = "") -> str:
     """Bring back the session, sub-agent transcripts, lesson edits and commits.
 
     Prime's git repository is only read by git running as PRIME_USER: its
@@ -526,12 +549,13 @@ def collect_from_jail(ctx: dict) -> str:
     if root:
         artifacts = Path("session-artifacts") / root.stem
         copy_regular(JAIL / "agent" / artifacts, AGENT / artifacts)
-    for rel in lesson_paths():
-        src, dst = JAIL / "agent" / rel, AGENT / rel
-        if regular_file(src):
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dst)
-    copy_regular(JAIL / "agent" / "harness", AGENT / "harness")
+    if command_routing.can_propose_learning(command):
+        for rel in lesson_paths():
+            src, dst = JAIL / "agent" / rel, AGENT / rel
+            if regular_file(src):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+        copy_regular(JAIL / "agent" / "harness", AGENT / "harness")
     return prime_head
 
 
@@ -603,10 +627,12 @@ def stream_progress(proc, started: float, deadline: int = 2400) -> str:
 
 # -------------------------------------------------------------- commits ----
 
-def check_and_push(ctx: dict, prime_head: str) -> tuple[str, list[str], str]:
+def check_and_push(ctx: dict, prime_head: str, command: str = "") -> tuple[str, list[str], str]:
     """Return (new head, list of pushed commit lines, note)."""
     if not prime_head or prime_head == ctx["head"]:
         return ctx["head"], [], ""
+    if not command_routing.can_push_commits(command):
+        return ctx["head"], [], "ask command is read-only; commits not pushed"
     bundle = OUT / "commits.bundle"
     if not regular_file(bundle) or git(["fetch", "--quiet", "--no-tags", str(bundle), "HEAD"],
                                        PR_DIR, check=False).returncode != 0:
@@ -847,7 +873,9 @@ def save_state(meta: dict, res: dict) -> None:
     raise RuntimeError("could not save state after retries")
 
 
-def propose_learning() -> str:
+def propose_learning(command: str = "") -> str:
+    if not command_routing.can_propose_learning(command):
+        return ""
     allowed = [str(PLAYBOOK.relative_to(AGENT) / "SKILL.md"),
                "skills/common-review/SKILL.md", "harness"]
     allowed = [p for p in allowed if (AGENT / p).exists()
@@ -916,6 +944,8 @@ def write_summary(meta: dict) -> None:
         ("Cost (Prime's estimate)", f"${u.get('cost', 0):.4f}"),
         ("Model", meta.get("model")), ("Trace", f"`{trace_label}`"),
     ]
+    if meta.get("ci_summary"):
+        rows.append(("CI status", meta["ci_summary"]))
     if meta.get("push_note"):
         rows.append(("Not pushed", meta["push_note"]))
     if meta.get("playbook_pr"):
@@ -957,8 +987,8 @@ def main() -> int:
         else (saved_session().exists() and any(saved_session().glob("*.jsonl")))
     )
 
-    mode, instruction, focus = parse_mode(has_saved=has_saved)
-    log(f"mode: {mode} ({EVENT} {ACTION})")
+    mode, instruction, focus, command = parse_mode(has_saved=has_saved)
+    log(f"mode: {mode} (command: {command}, {EVENT} {ACTION})")
     react("eyes")
 
     if mode == "carry":
@@ -974,6 +1004,7 @@ def main() -> int:
                 return 1 if blockers else 0
             log("no earlier run produced this commit: reviewing the update instead")
             mode = "update"
+            command = "update"
         else:
             prior = [m for m in pr_traces() if m.get("head_after") == head]
             if prior:
@@ -985,8 +1016,17 @@ def main() -> int:
                 return 1 if blockers else 0
             log("no earlier run produced this commit: reviewing the update instead")
             mode = "update"
+            command = "update"
 
     ctx = checkout_pr()
+    ci_data = ci_evidence.fetch_ci_snapshot(
+        repo=REPO,
+        head_sha=ctx["head"],
+        app_slug=os.environ.get("APP_SLUG", ""),
+        gh_api_fn=gh_api,
+    )
+    log(f"CI evidence: {ci_data.get('overall_state')} ({ci_data.get('summary', {})})")
+
     if B2_MODE:
         ctx["last"] = latest_meta.get("head_after") if latest_meta else None
     else:
@@ -996,10 +1036,25 @@ def main() -> int:
     if not B2_MODE:
         git(["remote", "set-url", "origin", f"https://github.com/{CONFIG_REPO}.git"], AGENT)
 
-    res = run_prime(ctx, mode, instruction, focus)
+    res = run_prime(ctx, mode, instruction, focus, command=command, ci_data=ci_data)
     res["mode"] = mode
+    res["command"] = command
     result = res["result"] or {}
-    blockers = gate_blockers(res["result"])
+
+    if res["result"] is None:
+        blockers = [{"section": 0, "title": "the reviewer produced no result"}]
+    elif mode == "instruct":
+        current_blockers = gate_blockers(res["result"])
+        prior_blockers = []
+        if latest_meta and latest_meta.get("gate_blockers"):
+            prior_blockers = latest_meta.get("gate_blockers")
+        elif not B2_MODE:
+            traces = pr_traces()
+            if traces and traces[-1].get("gate_blockers"):
+                prior_blockers = traces[-1].get("gate_blockers")
+        blockers = current_blockers or prior_blockers
+    else:
+        blockers = gate_blockers(res["result"])
 
     config_commit = ""
     if (AGENT / ".git").exists():
@@ -1010,6 +1065,7 @@ def main() -> int:
 
     meta = {
         "run_id": RUN_ID, "run_url": RUN_URL, "repo": REPO, "pr": int(PR), "mode": mode,
+        "command": command,
         "config_ref": CONFIG_REF, "config_commit": config_commit,
         "event": EVENT, "action": ACTION, "model": MODEL,
         "prime_version": os.environ.get("PRIME_AGENT_VERSION"),
@@ -1022,13 +1078,15 @@ def main() -> int:
         "gate_blockers": blockers, "push_note": "", "playbook_pr": "", "error": "",
         "session_lines_before": res["lines_before"],
         "usage": usage_since(res["lines_before"]),
+        "ci_evidence": ci_data,
+        "ci_summary": f"{ci_data['overall_state']} ({ci_data['summary']['pass']} pass, {ci_data['summary']['fail']} fail, {ci_data['summary']['pending']} pending)",
     }
     # The trace is saved whatever happens next: a failed run is the one a
     # trace viewer is most needed for.
     try:
-        new_head, commits, note = check_and_push(ctx, res["prime_head"])
+        new_head, commits, note = check_and_push(ctx, res["prime_head"], command=command)
         meta.update(head_after=new_head, fixes_pushed=len(commits), push_note=note)
-        learn_url = propose_learning()
+        learn_url = propose_learning(command=command)
         meta["playbook_pr"] = learn_url
         post_review(ctx, new_head, res, commits, note, meta, learn_url)
     except Exception as e:

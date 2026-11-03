@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from migrate_state import migrate
 from state_store import B2StateStore
 from test_state_store import FakeS3Client
