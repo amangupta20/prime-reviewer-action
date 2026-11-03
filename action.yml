@@ -162,7 +162,11 @@ runs:
     - name: Install object storage client
       if: inputs.b2-bucket != ''
       shell: bash
-      run: python3 -m pip install --disable-pip-version-check 'boto3==1.42.4'
+      # --target: the wrapper runs with python3 -I, which ignores a per-user
+      # install, and the runner's system Python may refuse a global one.
+      run: >-
+        python3 -m pip install --disable-pip-version-check --quiet
+        --target "$RUNNER_TEMP/prime-pylib" 'boto3==1.42.4'
 
     # Event text (comments, the PR body) reaches the script through the
     # environment, never pasted into a shell line.
@@ -198,4 +202,5 @@ runs:
         PR_BODY: ${{ github.event.pull_request.body }}
         RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        PRIME_PYLIB: ${{ runner.temp }}/prime-pylib
       run: python3 -I "$GITHUB_ACTION_PATH/prime-review.py"

@@ -47,6 +47,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+# action.yml installs boto3 with pip --target; -I ignores PYTHONPATH and the
+# user's site-packages, so the folder is added here.
+if os.environ.get("PRIME_PYLIB"):
+    sys.path.insert(0, os.environ["PRIME_PYLIB"])
+
 import state_store
 
 WORK = Path.cwd()
