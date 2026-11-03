@@ -36,7 +36,9 @@ fix_check = ""
         self.env = dict(REPO='owner/homelab', OWNER='owner', PR_NUMBER='7',
                         RUN_ID='test-1', RUN_URL='https://example.com/run',
                         EVENT_NAME='pull_request_target', GH_TOKEN='fake',
-                        APP_SLUG='reviewer', PR_AUTHOR='owner', EVENT_ACTION='synchronize')
+                        APP_SLUG='reviewer', PR_AUTHOR='owner', EVENT_ACTION='synchronize',
+                        OPENCODE_API_KEY='model-key',
+                        PRIME_JAIL=str(Path(self.temp.name) / 'jail'))
         self.mod = self.load()
 
     def load(self, **env):
@@ -151,6 +153,91 @@ fix_check = ""
         self.assertEqual(sorted(changed), ['repos/homelab/playbook/SKILL.md', 'skills/common-review/SKILL.md'])
         self.assertIn('learn/homelab-pr-7-test-1', pushes[0][-1])
 
+
+    def test_credentials_leave_the_process_environment(self):
+        self.assertEqual(self.mod['SECRETS'], {'GH_TOKEN': 'fake', 'OPENCODE_API_KEY': 'model-key'})
+        fn = self.mod['git']
+        seen = []
+        def fake_run(cmd, **kwargs):
+            seen.append((cmd, kwargs.get('env')))
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+        with patch.dict(os.environ, {'PATH': '/usr/bin'}, clear=True), \
+                patch.dict(fn.__globals__, run=fake_run):
+            fn(['push', 'origin', 'HEAD'], self.work, auth=True)
+            fn(['status'], self.work)
+            self.assertEqual(fn.__globals__['gh_env']()['GH_TOKEN'], 'fake')
+        (push, push_env), (status, status_env) = seen
+        # The token travels in the environment, never on a command line.
+        self.assertNotIn('fake', ' '.join(push))
+        self.assertTrue(any('basic' in v for v in push_env.values()))
+        self.assertIsNone(status_env)
+
+    def test_copy_back_skips_symlinks(self):
+        src, dst = self.work / 'src', self.work / 'dst'
+        (src / 'sub').mkdir(parents=True)
+        (src / 'sub/kept.jsonl').write_text('{}\n')
+        secret = self.work / 'secret.txt'
+        secret.write_text('private\n')
+        (src / 'link.jsonl').symlink_to(secret)
+        (src / 'linkdir').symlink_to(self.work)
+        self.mod['copy_regular'](src, dst)
+        self.assertEqual(sorted(str(p.relative_to(dst)) for p in dst.rglob('*') if p.is_file()),
+                         ['sub/kept.jsonl'])
+
+    def _pr_with_bundle(self, change):
+        """A PR checkout and a bundle of one commit made by `change` in a copy."""
+        pr = self.work / 'pr'
+        def g(cwd, *args):
+            return subprocess.run(['git', *args], cwd=cwd, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        pr.mkdir()
+        g(pr, 'init', '-q', '-b', 'feature')
+        g(pr, 'config', 'user.email', 'test@example.com')
+        g(pr, 'config', 'user.name', 'Test')
+        (pr / 'iac').mkdir()
+        (pr / 'iac/main.tf').write_text('x\n')
+        (pr / 'notes.md').write_text('a\n')
+        g(pr, 'add', '.')
+        g(pr, 'commit', '-qm', 'Base')
+        head = g(pr, 'rev-parse', 'HEAD')
+        work = self.work / 'copy'
+        g(self.work, 'clone', '-q', str(pr), str(work))
+        g(work, 'config', 'user.email', 'test@example.com')
+        g(work, 'config', 'user.name', 'Test')
+        change(work, g)
+        g(work, 'commit', '-qam', 'Change')
+        out = Path(self.env['PRIME_JAIL']) / 'out'
+        out.mkdir(parents=True)
+        g(work, 'bundle', 'create', '-q', str(out / 'commits.bundle'), 'HEAD', f'^{head}')
+        return head, g(work, 'rev-parse', 'HEAD')
+
+    def _check_and_push(self, head, prime_head):
+        fn = self.mod['check_and_push']
+        real_git = fn.__globals__['git']
+        pushes = []
+        def fake_git(args, cwd, **kwargs):
+            if args[0] == 'push':
+                pushes.append(args)
+                return subprocess.CompletedProcess([], 0, '', '')
+            return real_git(args, cwd, **kwargs)
+        ctx = {'head': head, 'pr': {'state': 'open', 'head': {'ref': 'feature'}}}
+        with patch.dict(fn.__globals__, git=fake_git):
+            return fn(ctx, prime_head), pushes
+
+    def test_commits_come_back_from_the_bundle(self):
+        def edit(work, g):
+            (work / 'notes.md').write_text('b\n')
+        head, prime_head = self._pr_with_bundle(edit)
+        (new_head, commits, note), pushes = self._check_and_push(head, prime_head)
+        self.assertEqual((new_head, note, len(commits), len(pushes)), (prime_head, '', 1, 1))
+
+    def test_moving_a_protected_file_out_is_not_pushed(self):
+        def move(work, g):
+            g(work, 'mv', 'iac/main.tf', 'main.tf')
+        head, prime_head = self._pr_with_bundle(move)
+        (new_head, commits, note), pushes = self._check_and_push(head, prime_head)
+        self.assertEqual((new_head, pushes), (head, []))
+        self.assertIn('iac/main.tf', note)
 
 if __name__ == '__main__':
     unittest.main()
