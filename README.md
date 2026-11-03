@@ -11,7 +11,8 @@ that private repository, sharing one core and common lessons.
 
 Implemented 2026-11-03. Offline regression tests cover repository isolation,
 legacy session restore, gate configuration, protected paths and lesson routing.
-A live GitHub run of this composite action is UNTESTED until a caller merges.
+The first live run was a review on homelab pull request 31 (2026-11-03,
+release `v1.1.0`, B2 storage, approve). A live `/prime` reply is UNTESTED.
 
 ## Caller
 
@@ -70,7 +71,7 @@ and only regular files are copied back (session, sub-agent transcripts and
 the lesson files it may edit). The configured check also runs as
 `prime-runner`, on a fresh copy of the commits about to be pushed. Prime is
 installed fresh for that user on every run instead of from a cache.
-UNTESTED on GitHub until the first run of a release that contains it.
+UNTESTED on GitHub until the first run of a commit that contains it.
 
 ## Validation
 
