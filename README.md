@@ -50,8 +50,10 @@ branch. `fix_check` is a trusted shell command run in the pull-request working
 directory; never use it to execute scripts added or changed by the pull request.
 Empty check and blocking-section values explicitly opt out; missing fields fail.
 
-Sessions use `sessions/<repo>/pr-<n>/` on the private `state` branch. Historical
-homelab sessions have a read fallback. Trace metadata includes the full repo,
+With `state-backend: b2`, sessions and traces live in B2 (see "B2 runtime
+storage"). Without B2 inputs, sessions use `sessions/<repo>/pr-<n>/` on the
+private `state` branch, with a read fallback for historical homelab sessions.
+Trace metadata includes the full repo,
 config ref, run, usage, result and head commits. Proposed lesson pull requests
 can stage only the current playbook, common-review and harness lessons.
 
