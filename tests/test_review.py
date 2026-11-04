@@ -302,6 +302,40 @@ fix_check = ""
         self.assertEqual(calls[-1][0], 'repos/owner/homelab/issues/comments/2')
         self.assertEqual(calls[-1][1], 'PATCH')
         self.assertIn('Prime: Blocked', calls[-1][2]['body'])
+
+    def test_closed_pr_checkout_survives_deleted_source_branch(self):
+        source = self.work / 'source'
+        source.mkdir()
+        def local_git(*args):
+            return subprocess.run(['git', *args], cwd=source, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        local_git('init', '-b', 'main')
+        local_git('config', 'user.name', 'Test')
+        local_git('config', 'user.email', 'test@example.com')
+        (source / 'note').write_text('base')
+        local_git('add', '.')
+        local_git('commit', '-m', 'base')
+        local_git('checkout', '-b', 'deleted-feature')
+        (source / 'note').write_text('PR change')
+        local_git('commit', '-am', 'change')
+        expected = local_git('rev-parse', 'HEAD')
+        local_git('update-ref', 'refs/pull/7/head', expected)
+        local_git('checkout', 'main')
+        local_git('branch', '-D', 'deleted-feature')
+        fn = self.mod['checkout_pr']
+        original_git = fn.__globals__['git']
+        def git(args, cwd, **kwargs):
+            if args[:3] == ['remote', 'add', 'origin']:
+                args = [*args[:3], str(source)]
+            return original_git(args, cwd, **kwargs)
+        pr = {'state': 'closed', 'head': {'ref': 'deleted-feature',
+              'repo': {'full_name': 'owner/homelab'}}, 'base': {'ref': 'main'}}
+        def api(path):
+            return {'id': 1} if path.startswith('users/') else pr
+        with patch.dict(fn.__globals__, git=git, gh_api=api), patch.dict(os.environ, self.env):
+            ctx = fn()
+        self.assertEqual(ctx['head'], expected)
+        self.assertEqual((self.mod['PR_DIR'] / 'note').read_text(), 'PR change')
     def _session(self, folder, name, cwd, records=(), mtime=None):
         folder.mkdir(parents=True, exist_ok=True)
         f = folder / name
