@@ -88,6 +88,24 @@ bounded, untrusted context:
   are never fetched, avoiding credential exposure.
 - No automatic workflow reruns or polling are triggered.
 
+## Interaction status and review coverage
+
+The action maintains one marked PR comment showing Working, Completed,
+Blocked or Failed, the run link, PR commit, last reviewed commit and CI state
+at run start. A rejected push fails the command run and shows Blocked.
+Completed means execution completed, not that GitHub can merge the PR.
+Hard runner cancellation can leave Working visible; follow its run link.
+
+Conversation snapshots and review coverage are separate. Questions and fixes
+preserve the last reviewed commit and existing blockers; only a successful
+review can advance coverage and clear blockers. Reviewer-generated commits
+receive a follow-up review unless that exact commit already has coverage.
+Historical instruction snapshots with unknown coverage cause a full review.
+
+CI evidence requires the App to read checks and commit statuses. Missing
+access is reported as unavailable, never passing. Live interaction validation
+of this update is pending rollout of the caller pin.
+
 ## Isolation
 
 Prime runs as a separate Linux user, `prime-runner`, created by the action.

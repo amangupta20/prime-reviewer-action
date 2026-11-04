@@ -286,14 +286,22 @@ fix_check = ""
         with self.assertRaises(ValueError):
             parse_with_comment('/primer review')
 
-    def test_gate_blockers_preserved_on_instruct_mode(self):
-        prior_blockers = [{'section': 1, 'path': 'main.py', 'line': 10, 'title': 'Blocker 1'}]
-        latest_meta = {'gate_blockers': prior_blockers}
-        res_empty = {'result': {'reply': 'Here is the answer'}}
-
-        cur = self.mod['gate_blockers'](res_empty['result'])
-        blockers = cur or latest_meta['gate_blockers']
-        self.assertEqual(blockers, prior_blockers)
+    def test_status_updates_only_our_marked_comment(self):
+        fn = self.mod['update_status']
+        calls = []
+        marker = self.mod['review_state'].MARKER
+        def api(path, method='GET', body=None):
+            calls.append((path, method, body))
+            if method == 'GET':
+                return [
+                    {'id': 1, 'user': {'login': 'owner'}, 'body': marker},
+                    {'id': 2, 'user': {'login': 'reviewer[bot]'}, 'body': marker},
+                ]
+        with patch.dict(fn.__globals__, gh_api=api), patch.dict(os.environ, APP_SLUG='reviewer'):
+            fn('Blocked', note='Changes were not pushed.')
+        self.assertEqual(calls[-1][0], 'repos/owner/homelab/issues/comments/2')
+        self.assertEqual(calls[-1][1], 'PATCH')
+        self.assertIn('Prime: Blocked', calls[-1][2]['body'])
     def _session(self, folder, name, cwd, records=(), mtime=None):
         folder.mkdir(parents=True, exist_ok=True)
         f = folder / name

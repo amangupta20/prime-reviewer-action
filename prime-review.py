@@ -54,6 +54,7 @@ if os.environ.get("PRIME_PYLIB"):
 
 import ci_evidence
 import command_routing
+import review_state
 import state_store
 
 WORK = Path.cwd()
@@ -1013,6 +1014,21 @@ def verify_legacy_snapshot(meta: dict | None) -> None:
             "Legacy state changed after import; refresh the B2 migration before continuing")
 
 
+def update_status(state, head=None, reviewed=None, ci=None, note=None):
+    """Update only this App's marked overview; never edit a user's comment."""
+    body = review_state.status_body(state, RUN_URL, head, reviewed, ci, note)
+    for page in range(1, 11):
+        comments = gh_api(f"repos/{REPO}/issues/{PR}/comments?per_page=100&page={page}")
+        for comment in comments or []:
+            if (comment.get("user", {}).get("login") == f"{os.environ['APP_SLUG']}[bot]"
+                    and comment.get("body", "").startswith(review_state.MARKER)):
+                gh_api(f"repos/{REPO}/issues/comments/{comment['id']}", "PATCH", {"body": body})
+                return
+        if len(comments or []) < 100:
+            break
+    gh_api(f"repos/{REPO}/issues/{PR}/comments", "POST", {"body": body})
+
+
 def main() -> int:
     if GATE and os.environ.get("PR_AUTHOR") != OWNER:
         log("not reviewed: only the owner's pull requests are; the owner reviews this one by hand")
@@ -1041,7 +1057,7 @@ def main() -> int:
     if mode == "carry":
         head = os.environ.get("HEAD_SHA", "")
         if B2_MODE:
-            if latest_meta and latest_meta.get("head_after") == head:
+            if latest_meta and review_state.reviewed_sha(latest_meta) == head:
                 blockers = latest_meta.get("gate_blockers") or []
                 prior_run = latest_meta.get("run_id", "prior")
                 log(f"commit {head[:7]} was pushed by the reviewer in run {prior_run}: "
@@ -1053,7 +1069,7 @@ def main() -> int:
             mode = "update"
             command = "update"
         else:
-            prior = [m for m in pr_traces() if m.get("head_after") == head]
+            prior = [m for m in pr_traces() if review_state.reviewed_sha(m) == head]
             if prior:
                 blockers = prior[-1].get("gate_blockers") or []
                 log(f"commit {head[:7]} was pushed by the reviewer in run {prior[-1]['run_id']}: "
@@ -1075,10 +1091,15 @@ def main() -> int:
     log(f"CI evidence: {ci_data.get('overall_state')} ({ci_data.get('summary', {})})")
 
     if B2_MODE:
-        ctx["last"] = latest_meta.get("head_after") if latest_meta else None
+        ctx["last"] = review_state.reviewed_sha(latest_meta)
     else:
         traces = pr_traces()
-        ctx["last"] = traces[-1]["head_after"] if traces else None
+        latest_meta = traces[-1] if traces else None
+        ctx["last"] = review_state.reviewed_sha(latest_meta)
+
+    if mode == "update" and not ctx["last"]:
+        mode = command = "review"
+    update_status("Working", ctx["head"], ctx["last"], ci_data.get("overall_state"))
 
     if not B2_MODE:
         git(["remote", "set-url", "origin", f"https://github.com/{CONFIG_REPO}.git"], AGENT)
@@ -1099,9 +1120,13 @@ def main() -> int:
             traces = pr_traces()
             if traces and traces[-1].get("gate_blockers"):
                 prior_blockers = traces[-1].get("gate_blockers")
-        blockers = current_blockers or prior_blockers
+        blockers = review_state.merge_blockers(prior_blockers, current_blockers)
     else:
         blockers = gate_blockers(res["result"])
+
+    reviewed, blockers = review_state.checkpoint(
+        latest_meta, mode, ctx["head"], blockers,
+        res["result"] is not None and res["exit"] == 0)
 
     config_commit = ""
     if (AGENT / ".git").exists():
@@ -1120,6 +1145,7 @@ def main() -> int:
         "duration_s": res["duration"], "prime_exit": res["exit"],
         "head_before": ctx["head"], "head_after": ctx["head"], "base": ctx["base"],
         "last_reviewed": ctx["last"],
+        "reviewed_sha": reviewed,
         "verdict": result.get("verdict"),
         "findings": len(result.get("findings") or []), "fixes_pushed": 0,
         "gate_blockers": blockers, "push_note": "", "playbook_pr": "", "error": "",
@@ -1131,9 +1157,13 @@ def main() -> int:
     # The trace is saved whatever happens next: a failed run is the one a
     # trace viewer is most needed for.
     try:
-        new_head, commits, note = check_and_push(ctx, res["prime_head"], command=command)
+        if res["result"] is None or res["exit"] != 0:
+            new_head, commits, note = ctx["head"], [], "review execution failed; commits not pushed"
+        else:
+            new_head, commits, note = check_and_push(ctx, res["prime_head"], command=command)
         meta.update(head_after=new_head, fixes_pushed=len(commits), push_note=note)
-        learn_url = propose_learning(command=command)
+        learn_url = (propose_learning(command=command)
+                     if res["result"] is not None and res["exit"] == 0 else "")
         meta["playbook_pr"] = learn_url
         post_review(ctx, new_head, res, commits, note, meta, learn_url)
     except Exception as e:
@@ -1142,8 +1172,16 @@ def main() -> int:
     finally:
         save_state(meta, res)
         write_summary(meta)
+    failed = res["result"] is None or res["exit"] != 0
+    state = "Failed" if failed else "Blocked" if note or blockers else "Completed"
+    update_status(state, meta["head_after"], reviewed, ci_data.get("overall_state"),
+                  "The requested changes were not pushed; see the reply for details." if note else
+                  "Review has unresolved blockers." if blockers else
+                  "Execution completed. This does not establish that the PR is mergeable.")
     react("rocket" if res["result"] is not None else "confused")
     log(f"done: {json.dumps({k: meta[k] for k in ('verdict', 'findings', 'fixes_pushed', 'duration_s')})}")
+    if failed or note:
+        return 1
     if GATE and blockers:
         for b in blockers:
             log(f"blocking: section {b.get('section')} {b.get('path')}:{b.get('line')} {b.get('title')}")
@@ -1155,6 +1193,10 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:  # report, never dump the environment
+        try:
+            update_status("Failed", note="The run failed. See the run log for details.")
+        except Exception:
+            pass
         log(f"failed: {e.__class__.__name__}: {str(e)[:500]}")
         react("confused")
         sys.exit(1)
