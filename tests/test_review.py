@@ -239,5 +239,49 @@ fix_check = ""
         self.assertEqual((new_head, pushes), (head, []))
         self.assertIn('iac/main.tf', note)
 
+    def _session(self, folder, name, cwd, records=(), mtime=None):
+        folder.mkdir(parents=True, exist_ok=True)
+        f = folder / name
+        lines = [json.dumps({'type': 'session', 'id': name, 'cwd': cwd})]
+        lines += [json.dumps(r) for r in records]
+        f.write_text('\n'.join(lines) + '\n')
+        if mtime is not None:
+            os.utime(f, (mtime, mtime))
+        return f
+
+    def test_saved_session_is_pointed_at_the_jail_folder(self):
+        sessions = self.work / 'sessions'
+        old = self._session(sessions, 'a.jsonl', '/home/runner/pr', [{'n': 1}], mtime=1000)
+        (sessions / 'a.info-cache.json').write_text('{}')
+        jail = self.work / 'jail/work'
+        self.mod['repoint_session_cwd'](sessions, jail)
+        header, rest = old.read_text().split('\n', 1)
+        self.assertEqual(json.loads(header)['cwd'], str(jail))
+        self.assertEqual(rest, json.dumps({'n': 1}) + '\n')
+        self.assertEqual(old.stat().st_mtime, 1000)
+        self.assertFalse((sessions / 'a.info-cache.json').exists())
+
+    def test_a_session_already_in_the_jail_folder_is_left_alone(self):
+        sessions = self.work / 'sessions'
+        jail = self.work / 'jail/work'
+        older = self._session(sessions, 'a.jsonl', '/home/runner/pr', mtime=1000)
+        self._session(sessions, 'b.jsonl', str(jail), mtime=900)
+        before = older.read_text()
+        self.mod['repoint_session_cwd'](sessions, jail)
+        self.assertEqual(older.read_text(), before)
+
+    def test_usage_comes_from_the_session_prime_wrote(self):
+        sessions = self.work / 'sessions'
+        turn = {'message': {'role': 'assistant', 'usage': {'input': 10, 'output': 2,
+                                                           'cost': {'total': 0.5}}}}
+        # Sorted first by name, but older: an earlier conversation.
+        self._session(sessions, 'a.jsonl', '/old', [turn], mtime=1000)
+        new = self._session(sessions, 'z.jsonl', '/new', [turn, turn], mtime=2000)
+        fn = self.mod['usage_since']
+        with patch.dict(fn.__globals__, SESSION=sessions, AGENT=self.agent):
+            self.assertEqual(self.mod['state_store'].newest_session_file(sessions), new)
+            u = fn(0)
+        self.assertEqual((u['turns'], u['cost']), (2, 1.0))
+
 if __name__ == '__main__':
     unittest.main()
