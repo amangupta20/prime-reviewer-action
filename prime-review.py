@@ -370,10 +370,14 @@ def checkout_pr() -> dict:
         log("pull request is not open: fixes will not be pushed")
     if PR_DIR.exists():
         shutil.rmtree(PR_DIR)
-    run(["git", "clone", "--quiet", "--no-tags",
-         "--branch", pr["head"]["ref"], f"https://github.com/{REPO}.git", str(PR_DIR)],
-        env=auth_env())
-    git(["fetch", "--quiet", "origin", pr["base"]["ref"]], PR_DIR)
+    PR_DIR.mkdir(parents=True)
+    git(["init", "--quiet"], PR_DIR)
+    git(["remote", "add", "origin", f"https://github.com/{REPO}.git"], PR_DIR)
+    # PR refs survive deletion of the source branch after merge.
+    git(["fetch", "--quiet", "--no-tags", "origin", f"refs/pull/{PR}/head"], PR_DIR, auth=True)
+    git(["checkout", "--quiet", "-b", "prime-work", "FETCH_HEAD"], PR_DIR)
+    git(["fetch", "--quiet", "origin",
+         f"refs/heads/{pr['base']['ref']}:refs/remotes/origin/{pr['base']['ref']}"], PR_DIR, auth=True)
     base = git(["merge-base", "HEAD", f"origin/{pr['base']['ref']}"], PR_DIR).stdout.strip()
     head = git(["rev-parse", "HEAD"], PR_DIR).stdout.strip()
     bot = gh_api(f"users/{os.environ['APP_SLUG']}%5Bbot%5D")
