@@ -238,7 +238,52 @@ def copy_regular(src: Path, dst: Path) -> None:
                 continue
             target = dst / p.relative_to(src)
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(p, target)
+            shutil.copy2(p, target)
+
+
+def line_counts(session_dir: Path) -> dict[str, int]:
+    """Lines per root session file, to tell this run's records from older ones."""
+    counts = {}
+    for f in session_dir.glob("*.jsonl"):
+        if f.is_file() and not f.is_symlink():
+            with open(f, errors="replace") as fh:
+                counts[f.name] = sum(1 for _ in fh)
+    return counts
+
+
+def repoint_session_cwd(session_dir: Path, cwd: Path) -> None:
+    """Make `-c` find the saved conversation from Prime's working folder.
+
+    Prime continues only the newest session whose header (the file's first
+    line) records the current folder; otherwise it starts a new one (Prime
+    0.10.2, `find_most_recent_session_for_cwd` in print_runtime.rs). Sessions
+    saved before Prime ran in the jail record another folder, so the newest
+    one is pointed here, unless a session for this folder already exists.
+    """
+    headers = {}
+    for f in session_dir.glob("*.jsonl"):
+        if not f.is_file() or f.is_symlink():
+            continue
+        try:
+            with open(f) as fh:
+                header = json.loads(fh.readline())
+        except (OSError, ValueError):
+            continue
+        if isinstance(header, dict) and isinstance(header.get("cwd"), str):
+            headers[f] = header
+    if not headers or any(h["cwd"] == str(cwd) for h in headers.values()):
+        return
+    newest = state_store.newest_session_file(session_dir)
+    if newest not in headers:
+        return
+    stat = newest.stat()
+    lines = newest.read_text().splitlines(keepends=True)
+    lines[0] = json.dumps({**headers[newest], "cwd": str(cwd)}, separators=(",", ":")) + "\n"
+    newest.write_text("".join(lines))
+    os.utime(newest, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    # Prime caches per-session scan results next to the file; drop the stale one.
+    newest.with_name(newest.stem + ".info-cache.json").unlink(missing_ok=True)
+    log("saved session now continues from the reviewer's working folder")
 
 
 def regular_file(p: Path) -> bool:
@@ -400,8 +445,7 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
         resume = SESSION.is_dir() and any(SESSION.glob("*.jsonl"))
         if not SESSION.exists():
             SESSION.mkdir(parents=True)
-    session_file = next(iter(sorted(SESSION.glob("*.jsonl"))), None)
-    lines_before = sum(1 for _ in open(session_file)) if session_file else 0
+    before = line_counts(SESSION)
 
     prepare_jail()
     playbook = JAIL / "agent" / PLAYBOOK.relative_to(AGENT)
@@ -487,6 +531,8 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
     log(f"Prime exited {code} after {duration}s")
 
     prime_head = collect_from_jail(ctx, command=command)
+    root = state_store.newest_session_file(SESSION)
+    lines_before = before.get(root.name, 0) if root else 0
     result = None
     try:
         if not regular_file(OUT / "result.json"):
@@ -512,6 +558,7 @@ def prepare_jail() -> None:
     shutil.copytree(RULES, JAIL / "rules", ignore=no_git, symlinks=True)
     shutil.copytree(AGENT, JAIL / "agent", ignore=no_git, symlinks=True)
     shutil.copytree(SESSION, JAIL / "session", symlinks=True)
+    repoint_session_cwd(JAIL / "session", JAIL / "work")
     # --no-hardlinks: Prime will own these objects, and they must not be the
     # same files as the checkout this wrapper pushes from.
     git(["clone", "--quiet", "--no-hardlinks", str(PR_DIR), str(JAIL / "work")], WORK)
@@ -545,7 +592,7 @@ def collect_from_jail(ctx: dict, command: str = "") -> str:
         shutil.rmtree(SESSION)
     SESSION.mkdir(parents=True)
     copy_regular(JAIL / "session", SESSION)
-    root = next(iter(sorted(SESSION.glob("*.jsonl"))), None)
+    root = state_store.newest_session_file(SESSION)
     if root:
         artifacts = Path("session-artifacts") / root.stem
         copy_regular(JAIL / "agent" / artifacts, AGENT / artifacts)
@@ -785,7 +832,7 @@ def post_review(ctx: dict, new_head: str, res: dict, commits: list[str], note: s
 def child_dirs() -> list[Path]:
     """Sub-agent transcripts of this run: Prime writes them under the agent
     folder, session-artifacts/<root session id>/<child id>/*.jsonl."""
-    root = next(iter(sorted(SESSION.glob("*.jsonl"))), None)
+    root = state_store.newest_session_file(SESSION)
     if not root:
         return []
     d = AGENT / "session-artifacts" / root.stem
@@ -817,7 +864,7 @@ def usage_since(lines_before: int) -> dict:
     """Usage of this run: the root session's new lines plus every sub-agent."""
     u = {"turns": 0, "tool_calls": 0, "input": 0, "output": 0, "cache_read": 0,
          "cost": 0.0, "subagent_transcripts": 0}
-    root = next(iter(sorted(SESSION.glob("*.jsonl"))), None)
+    root = state_store.newest_session_file(SESSION)
     if root:
         add_usage(u, root, lines_before)
     for d in child_dirs():
@@ -853,7 +900,7 @@ def save_state(meta: dict, res: dict) -> None:
     (trace / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     if res["result"] is not None:
         (trace / "result.json").write_text(json.dumps(res["result"], indent=2) + "\n")
-    f = next(iter(sorted(SESSION.glob("*.jsonl"))), None)
+    f = state_store.newest_session_file(SESSION)
     if f:
         shutil.copy(f, trace / "session.jsonl")
     for d in child_dirs():

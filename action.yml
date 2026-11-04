@@ -155,9 +155,12 @@ runs:
         id prime-runner >/dev/null 2>&1 || sudo useradd --create-home --shell /bin/bash prime-runner
         curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh -o "$RUNNER_TEMP/install.sh"
         sudo install -m 644 "$RUNNER_TEMP/install.sh" /home/prime-runner/install.sh
-        sudo -n -u prime-runner -H /usr/bin/env DO_NOT_TRACK=1 \
+        # From Prime's home: the job's folder is not readable by that user, and
+        # the installer's uv step reads uv.toml from the current folder.
+        sudo -n -u prime-runner -H /usr/bin/env --chdir=/home/prime-runner DO_NOT_TRACK=1 \
           PRIME_AGENT_VERSION="$PRIME_AGENT_VERSION" sh /home/prime-runner/install.sh
-        sudo -n -u prime-runner -H /home/prime-runner/.local/bin/prime-agent --version
+        sudo -n -u prime-runner -H /usr/bin/env --chdir=/home/prime-runner \
+          /home/prime-runner/.local/bin/prime-agent --version
 
     - name: Install object storage client
       if: inputs.b2-bucket != ''

@@ -96,6 +96,21 @@ def is_not_found(exc: Exception) -> bool:
     return False
 
 
+def newest_session_file(session_dir: Path) -> Path | None:
+    """The root session file Prime last wrote: the newest *.jsonl by mtime.
+
+    A folder can hold more than one, for example when Prime started a fresh
+    session because the saved one recorded another working folder. Names are
+    a tie-break only.
+    """
+    if not session_dir.is_dir():
+        return None
+    files = [p for p in session_dir.glob("*.jsonl") if p.is_file() and not p.is_symlink()]
+    if not files:
+        return None
+    return max(files, key=lambda p: (p.stat().st_mtime_ns, p.name))
+
+
 def safe_extract_tar(archive_source: Path | bytes | io.BytesIO, dest_dir: Path) -> list[str]:
     """Extract tar.gz safely into dest_dir.
 
@@ -210,11 +225,7 @@ def create_trace_bundle(
             tar.addfile(ti, io.BytesIO(result_data))
 
         # session.jsonl
-        root_session = (
-            next(iter(sorted(session_dir.glob("*.jsonl"))), None)
-            if session_dir.is_dir()
-            else None
-        )
+        root_session = newest_session_file(session_dir)
         if root_session and root_session.is_file():
             tar.add(root_session, arcname="session.jsonl")
 
@@ -248,9 +259,9 @@ def verify_trace_bundle_payload(
         if session_file_or_dir.is_file():
             orig_session_bytes = session_file_or_dir.read_bytes()
         elif session_file_or_dir.is_dir():
-            root_candidates = sorted(session_file_or_dir.glob("*.jsonl"))
-            if root_candidates:
-                orig_session_bytes = root_candidates[0].read_bytes()
+            root = newest_session_file(session_file_or_dir)
+            if root:
+                orig_session_bytes = root.read_bytes()
 
         dest_session = dest / "session.jsonl"
         if orig_session_bytes is not None:
