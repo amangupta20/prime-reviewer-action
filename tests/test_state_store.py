@@ -580,7 +580,7 @@ fix_check = ""
         (sess / "session.jsonl").write_text('{"turn": 1}\n')
         store.save_state(
             "run-prior",
-            {"head_after": "commit123", "gate_blockers": [], "run_id": "run-prior"},
+            {"head_after": "commit123", "reviewed_sha": "commit123", "gate_blockers": [], "run_id": "run-prior"},
             None,
             sess,
             [],
@@ -607,6 +607,7 @@ fix_check = ""
             "run-prior",
             {
                 "head_after": "commit_bad",
+                "reviewed_sha": "commit_bad",
                 "gate_blockers": [{"section": 1, "path": "p", "line": 2, "title": "b"}],
                 "run_id": "run-prior",
             },

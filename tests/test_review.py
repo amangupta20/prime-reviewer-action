@@ -211,7 +211,7 @@ fix_check = ""
         g(work, 'bundle', 'create', '-q', str(out / 'commits.bundle'), 'HEAD', f'^{head}')
         return head, g(work, 'rev-parse', 'HEAD')
 
-    def _check_and_push(self, head, prime_head):
+    def _check_and_push(self, head, prime_head, command=""):
         fn = self.mod['check_and_push']
         real_git = fn.__globals__['git']
         pushes = []
@@ -222,7 +222,7 @@ fix_check = ""
             return real_git(args, cwd, **kwargs)
         ctx = {'head': head, 'pr': {'state': 'open', 'head': {'ref': 'feature'}}}
         with patch.dict(fn.__globals__, git=fake_git):
-            return fn(ctx, prime_head), pushes
+            return fn(ctx, prime_head, command=command), pushes
 
     def test_commits_come_back_from_the_bundle(self):
         def edit(work, g):
@@ -239,6 +239,69 @@ fix_check = ""
         self.assertEqual((new_head, pushes), (head, []))
         self.assertIn('iac/main.tf', note)
 
+    def test_ask_command_cannot_push_even_with_commits_bundle(self):
+        def edit(work, g):
+            (work / 'notes.md').write_text('b\n')
+        head, prime_head = self._pr_with_bundle(edit)
+        (new_head, commits, note), pushes = self._check_and_push(head, prime_head, command="ask")
+        self.assertEqual(new_head, head)
+        self.assertEqual(commits, [])
+        self.assertEqual(pushes, [])
+        self.assertIn("ask command is read-only", note)
+
+    def test_ask_command_does_not_propose_learning(self):
+        fn = self.mod['propose_learning']
+        self.assertEqual(fn(command="ask"), "")
+
+    def test_parse_mode_routing(self):
+        saved = self.work / 'state/sessions/homelab/pr-7'
+        saved.mkdir(parents=True)
+        (saved / 'session.jsonl').write_text('{}\n')
+
+        def parse_with_comment(body):
+            mod = self.load(EVENT_NAME='issue_comment', COMMENT_BODY=body)
+            with patch.dict(os.environ, {**self.env, 'EVENT_NAME': 'issue_comment', 'COMMENT_BODY': body}):
+                return mod['parse_mode']()
+
+        # /prime review
+        self.assertEqual(parse_with_comment('/prime review'), ('review', '', '', 'review'))
+
+        # /prime review performance
+        self.assertEqual(parse_with_comment('/prime review performance'),
+                         ('review', '', 'performance', 'review'))
+
+        # /prime ask why is this mutex needed?
+        self.assertEqual(parse_with_comment('/prime ask why is this mutex needed?'),
+                         ('instruct', 'why is this mutex needed?', '', 'ask'))
+
+        # /prime fix add return statement
+        self.assertEqual(parse_with_comment('/prime fix add return statement'),
+                         ('instruct', 'add return statement', '', 'fix'))
+
+        # /prime natural instruction
+        self.assertEqual(parse_with_comment('/prime please check formatting'),
+                         ('instruct', 'please check formatting', '', 'instruct'))
+
+        # /primer should be rejected
+        with self.assertRaises(ValueError):
+            parse_with_comment('/primer review')
+
+    def test_status_updates_only_our_marked_comment(self):
+        fn = self.mod['update_status']
+        calls = []
+        marker = self.mod['review_state'].MARKER
+        def api(path, method='GET', body=None):
+            calls.append((path, method, body))
+            if method == 'GET':
+                return [
+                    {'id': 1, 'user': {'login': 'owner'}, 'body': marker},
+                    {'id': 2, 'user': {'login': 'reviewer[bot]'}, 'body': marker},
+                ]
+        with patch.dict(fn.__globals__, gh_api=api), patch.dict(os.environ, APP_SLUG='reviewer'):
+            fn('Blocked', note='Changes were not pushed.')
+        self.assertEqual(calls[-1][0], 'repos/owner/homelab/issues/comments/2')
+        self.assertEqual(calls[-1][1], 'PATCH')
+        self.assertIn('Prime: Blocked', calls[-1][2]['body'])
     def _session(self, folder, name, cwd, records=(), mtime=None):
         folder.mkdir(parents=True, exist_ok=True)
         f = folder / name
