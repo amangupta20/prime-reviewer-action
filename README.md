@@ -131,6 +131,10 @@ UNTESTED on GitHub until the first run of a commit that contains it.
 
 ## Validation
 
+If Prime exits 0 without writing `result.json`, the action resumes its session once and asks it to
+finish. A second miss fails the run. Models sometimes end a turn by announcing the next step (seen
+on three homelab runs, 2026-11-06), which otherwise fails the check with nothing wrong in the change.
+
 Run `python3 -I -m unittest discover -s tests -v` (run locally 2026-11-03).
 The test suite uses temporary local repositories and fake API calls, never
 model keys or GitHub writes. A live model review is separate validation.
