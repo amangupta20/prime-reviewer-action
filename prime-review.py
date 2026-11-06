@@ -437,6 +437,10 @@ Written only by the prime-reviewer action (`amangupta20/prime-reviewer-action`),
 
 # ------------------------------------------------------------------ run ----
 
+FINISH_PROMPT = ("Your last message ended the run, but $PRIME_OUT/result.json does not exist, so "
+                 "the run will fail. Do whatever you said you would do next, then write that "
+                 "file now. Do not end your turn until it is written.")
+
 def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
               command: str = "review", ci_data: dict | None = None) -> dict:
     if not B2_MODE:
@@ -509,30 +513,37 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
     cmd = [str(PRIME), "-p", "--mode", "json", "--session-dir", str(JAIL / "session"),
            "--provider", "opencode-go", "--model", MODEL, "--thinking", "high",
            "--skill", str(playbook)]
-    if resume:
-        cmd.append("-c")
-    cmd.append(prompt)
     # The model key is the one credential Prime gets. It travels through
     # sudo's preserved environment, never the command line, which any local
     # user can read; the other values are not secret.
     base = {"PATH": PRIME_PATH, "HOME": str(PRIME_HOME), "LANG": "C.UTF-8",
             "TMPDIR": str(JAIL / "tmp"), "DO_NOT_TRACK": "1"}
-    launch = ["sudo", "-n", "-u", PRIME_USER, "--preserve-env=OPENCODE_API_KEY", "--",
+    prefix = ["sudo", "-n", "-u", PRIME_USER, "--preserve-env=OPENCODE_API_KEY", "--",
               "/usr/bin/env", f"--chdir={JAIL / 'work'}",
               *[f"{k}={v}" for k, v in {**base, **env}.items()], *cmd]
 
+    def attempt(message: str, continue_session: bool) -> tuple[int, str]:
+        proc = subprocess.Popen([*prefix, *(["-c"] if continue_session else []), message],
+                                text=True, stdin=subprocess.DEVNULL,
+                                env={"PATH": "/usr/bin:/bin",
+                                     "OPENCODE_API_KEY": SECRETS.get("OPENCODE_API_KEY", "")},
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=1)
+        text = stream_progress(proc, started)
+        try:
+            return proc.wait(timeout=60), text
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return -9, text
+
     started = time.time()
     log(f"running Prime ({mode}, resume={resume}, model {MODEL})")
-    proc = subprocess.Popen(launch, text=True, stdin=subprocess.DEVNULL,
-                            env={"PATH": "/usr/bin:/bin",
-                                 "OPENCODE_API_KEY": SECRETS.get("OPENCODE_API_KEY", "")},
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=1)
-    final_text = stream_progress(proc, started)
-    try:
-        code = proc.wait(timeout=60)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        code = -9
+    code, final_text = attempt(prompt, resume)
+    # The model sometimes ends its turn announcing its next step instead of taking it, which
+    # exits 0 with no result. Its session is intact, so ask once; a second miss fails the run.
+    if code == 0 and not regular_file(OUT / "result.json"):
+        log("Prime stopped without a result; asking it to finish")
+        code, more = attempt(FINISH_PROMPT, True)
+        final_text = more or final_text
     as_prime([str(PRIME), "shutdown"], check=False)
     duration = round(time.time() - started)
     log(f"Prime exited {code} after {duration}s")

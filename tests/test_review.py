@@ -224,6 +224,52 @@ fix_check = ""
         with patch.dict(fn.__globals__, git=fake_git):
             return fn(ctx, prime_head, command=command), pushes
 
+    def _run_prime_with_results(self, writes_result):
+        """Runs run_prime with Prime faked: each attempt writes result.json or does not."""
+        fn = self.load()['run_prime']
+        g = fn.__globals__
+        out = self.work / 'out'
+        out.mkdir()
+        calls = []
+
+        class FakeProc:
+            stdout = []
+            def wait(self, timeout=None):
+                return 0
+
+        def popen(argv, **kwargs):
+            calls.append(argv)
+            if writes_result[len(calls) - 1]:
+                (out / 'result.json').write_text('{"verdict": "approve"}')
+            return FakeProc()
+
+        with patch.dict(g, {'OUT': out, 'prepare_jail': lambda: None,
+                            'as_prime': lambda *a, **k: None,
+                            'collect_from_jail': lambda *a, **k: 'head',
+                            'stream_progress': lambda proc, started: 'last words',
+                            'SESSION': self.work / 'session'}), \
+                patch.object(g['subprocess'], 'Popen', popen):
+            res = fn({'base': 'b', 'head': 'h'}, 'review', '', '')
+        return res, calls
+
+    def test_prime_is_not_asked_again_when_it_wrote_a_result(self):
+        res, calls = self._run_prime_with_results([True])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(res['result'], {'verdict': 'approve'})
+
+    def test_prime_is_asked_once_to_finish_without_a_result(self):
+        res, calls = self._run_prime_with_results([False, True])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('-c', calls[0])
+        self.assertIn('-c', calls[1])
+        self.assertIn('result.json', calls[1][-1])
+        self.assertEqual(res['result'], {'verdict': 'approve'})
+
+    def test_second_miss_fails_the_run(self):
+        res, calls = self._run_prime_with_results([False, False])
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(res['result'])
+
     def test_commits_come_back_from_the_bundle(self):
         def edit(work, g):
             (work / 'notes.md').write_text('b\n')
