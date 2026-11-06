@@ -19,7 +19,8 @@ Steps:
    configured check from the default branch, run as Prime's user) and push
    them with the App token.
 5. Post a review: suggestions and design comments on diff lines, the rest in
-   the summary. In instruct mode, reply to the comment.
+   the summary. In instruct mode, reply to the comment. With `approve-clean`,
+   approve a commit that reviewed clean and withdraw that approval otherwise.
 6. Save the session and a per-run trace to the `state` branch, and propose
    any change it made to its own playbook as a PR on the private repo.
 7. On pull_request_target runs (the required check), exit non-zero when a
@@ -152,6 +153,7 @@ MODEL = os.environ.get("PRIME_MODEL") or CONFIG.get("model", "deepseek-v4.1-flas
 ACTION = os.environ.get("EVENT_ACTION", "")
 SENDER = os.environ.get("SENDER", "")
 GATE = EVENT == "pull_request_target"
+APPROVE_CLEAN = os.environ.get("APPROVE_CLEAN") == "true"
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
 BLOCKING_SECTIONS = set(CONFIG.get("blocking_sections", []))
 
@@ -832,6 +834,50 @@ def post_review(ctx: dict, new_head: str, res: dict, commits: list[str], note: s
                {"body": body.replace(footer, "") + ("\n\n" + allf if allf else "") + footer})
 
 
+def review_is_clean(res: dict, blockers: list, note: str, head: str, new_head: str) -> bool:
+    """True when this run may vouch for the commit it reviewed. A commit the
+    reviewer just pushed gets its own follow-up review, which decides for it."""
+    return (res["result"] is not None and res["exit"] == 0
+            and res["result"].get("verdict") == "approve"
+            and not blockers and not note and new_head == head)
+
+
+def sync_approval(head: str, clean: bool) -> None:
+    """Make the App's approval match the review that just finished.
+
+    The approval is a separate review so that a rejected approval cannot lose
+    the findings, and a failure here never fails the check: the pull request
+    just stays unapproved, or the log says an approval could not be withdrawn.
+    """
+    if not APPROVE_CLEAN:
+        return
+    try:
+        bot = f"{os.environ['APP_SLUG']}[bot]"
+        mine = [r for r in gh_api(f"repos/{REPO}/pulls/{PR}/reviews?per_page=100")
+                if (r.get("user") or {}).get("login") == bot and r.get("state") == "APPROVED"]
+        if not clean:
+            for r in mine:
+                gh_api(f"repos/{REPO}/pulls/{PR}/reviews/{r['id']}/dismissals", "PUT",
+                       {"message": "A later review did not end in approve."})
+                log(f"withdrew approval {r['id']}")
+            return
+        if any(r.get("commit_id") == head for r in mine):
+            log(f"commit {head[:7]} is already approved")
+            return
+        # A push during the run is reviewed by the next run; do not vouch for it.
+        pr = gh_api(f"repos/{REPO}/pulls/{PR}")
+        if pr["state"] != "open" or pr["head"]["sha"] != head:
+            log(f"not approving {head[:7]}: the pull request is closed or has moved on")
+            return
+        gh_api(f"repos/{REPO}/pulls/{PR}/reviews", "POST", {
+            "commit_id": head, "event": "APPROVE",
+            "body": f"Clean review at this commit (run `{RUN_ID}`). Merging is the owner's call.",
+        })
+        log(f"approved {head[:7]}")
+    except Exception as e:
+        log(f"warning: could not update the approval: {e.__class__.__name__}: {str(e)[:300]}")
+
+
 # ---------------------------------------------------------------- state ----
 
 def child_dirs() -> list[Path]:
@@ -1170,6 +1216,8 @@ def main() -> int:
                      if res["result"] is not None and res["exit"] == 0 else "")
         meta["playbook_pr"] = learn_url
         post_review(ctx, new_head, res, commits, note, meta, learn_url)
+        if mode in ("review", "update"):
+            sync_approval(ctx["head"], review_is_clean(res, blockers, note, ctx["head"], new_head))
     except Exception as e:
         meta["error"] = f"{e.__class__.__name__}: {str(e)[:300]}"
         raise

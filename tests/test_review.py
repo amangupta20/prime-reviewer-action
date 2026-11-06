@@ -303,6 +303,64 @@ fix_check = ""
         self.assertEqual(calls[-1][1], 'PATCH')
         self.assertIn('Prime: Blocked', calls[-1][2]['body'])
 
+    def approval_calls(self, clean, reviews=(), head='abc', state='open', enabled=True, fail=False):
+        fn = self.mod['sync_approval']
+        calls = []
+        def api(path, method='GET', body=None):
+            calls.append((path, method, body))
+            if fail and method != 'GET':
+                raise RuntimeError('refused')
+            if path.endswith('/reviews?per_page=100'):
+                return list(reviews)
+            return {'state': state, 'head': {'sha': head}}
+        with patch.dict(fn.__globals__, gh_api=api, APPROVE_CLEAN=enabled), \
+                patch.dict(os.environ, APP_SLUG='reviewer'):
+            fn('abc', clean)
+        return [c for c in calls if c[1] != 'GET']
+
+    def own_approval(self, commit='old'):
+        return {'id': 9, 'user': {'login': 'reviewer[bot]'}, 'state': 'APPROVED', 'commit_id': commit}
+
+    def test_only_a_clean_finished_review_of_the_same_commit_counts(self):
+        fn = self.mod['review_is_clean']
+        ok = {'result': {'verdict': 'approve'}, 'exit': 0}
+        self.assertTrue(fn(ok, [], '', 'abc', 'abc'))
+        for verdict in ('needs_owner', 'request_changes', None):
+            self.assertFalse(fn({'result': {'verdict': verdict}, 'exit': 0}, [], '', 'abc', 'abc'))
+        self.assertFalse(fn({'result': None, 'exit': 0}, [], '', 'abc', 'abc'))
+        self.assertFalse(fn({**ok, 'exit': 1}, [], '', 'abc', 'abc'))
+        self.assertFalse(fn(ok, [{'section': 1}], '', 'abc', 'abc'))
+        self.assertFalse(fn(ok, [], 'not pushed', 'abc', 'abc'))
+        self.assertFalse(fn(ok, [], '', 'abc', 'fixed'))
+
+    def test_clean_review_approves_its_commit(self):
+        writes = self.approval_calls(True)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][0], 'repos/owner/homelab/pulls/7/reviews')
+        self.assertEqual(writes[0][2]['event'], 'APPROVE')
+        self.assertEqual(writes[0][2]['commit_id'], 'abc')
+
+    def test_approval_is_off_unless_the_caller_asks(self):
+        self.assertEqual(self.approval_calls(True, enabled=False), [])
+        self.assertEqual(self.approval_calls(False, [self.own_approval()], enabled=False), [])
+
+    def test_commit_that_moved_on_or_closed_pr_is_not_approved(self):
+        self.assertEqual(self.approval_calls(True, head='newer'), [])
+        self.assertEqual(self.approval_calls(True, state='closed'), [])
+
+    def test_commit_already_approved_is_not_approved_twice(self):
+        self.assertEqual(self.approval_calls(True, [self.own_approval('abc')]), [])
+
+    def test_unclean_review_withdraws_only_the_apps_approvals(self):
+        owner = {'id': 1, 'user': {'login': 'owner'}, 'state': 'APPROVED', 'commit_id': 'abc'}
+        comment = {'id': 2, 'user': {'login': 'reviewer[bot]'}, 'state': 'COMMENTED', 'commit_id': 'abc'}
+        writes = self.approval_calls(False, [owner, comment, self.own_approval('abc')])
+        self.assertEqual([w[:2] for w in writes],
+                         [('repos/owner/homelab/pulls/7/reviews/9/dismissals', 'PUT')])
+
+    def test_approval_failure_does_not_fail_the_run(self):
+        self.assertEqual(len(self.approval_calls(True, fail=True)), 1)
+
     def test_closed_pr_checkout_survives_deleted_source_branch(self):
         source = self.work / 'source'
         source.mkdir()
