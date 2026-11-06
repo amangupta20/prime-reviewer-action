@@ -31,6 +31,14 @@ Use `@v1` for the shared release or a commit SHA for an immutable version.
 `config-repo` defaults to `<owner>/prime-reviewer`, `config-ref` to `main`,
 `prime-version` to `0.10.2`. `model` overrides the repository's configured model.
 
+`approve-clean: "true"` (default `"false"`) makes a review or update run approve
+its commit as the App, only when the verdict is `approve`, no blocker is open
+and the run pushed nothing. A later review or update of the pull request that
+is not clean dismisses the App's approvals. Replies never change an approval.
+A required approval needs the App to have write access to the repository, and
+the ruleset's last-push approval off, because the App may push the last commit.
+A live approval is UNTESTED.
+
 ## Private configuration
 
 Required `repos/<repo>/config.toml` fields:

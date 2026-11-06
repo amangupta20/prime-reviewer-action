@@ -31,6 +31,12 @@ inputs:
     description: Overrides the model in the repo's config.toml.
     required: false
     default: ""
+  approve-clean:
+    description: >-
+      "true" lets the App approve a commit whose review verdict is approve, and
+      withdraw that approval when a later review of the pull request is not.
+    required: false
+    default: "false"
 
   state-backend:
     description: auto retains Git compatibility when B2 inputs are absent; b2 requires B2 configuration.
@@ -189,6 +195,7 @@ runs:
         CONFIG_REF: ${{ inputs.config-ref }}
         PRIME_AGENT_VERSION: ${{ inputs.prime-version }}
         PRIME_MODEL: ${{ inputs.model }}
+        APPROVE_CLEAN: ${{ inputs.approve-clean }}
         PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         REPO: ${{ github.repository }}
         OWNER: ${{ github.repository_owner }}
