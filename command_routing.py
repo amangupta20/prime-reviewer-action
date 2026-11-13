@@ -93,6 +93,16 @@ def can_push_commits(command: str) -> bool:
     return command not in ("ask", "unknown")
 
 
+def owner_asked_for_changes(command: str) -> bool:
+    """Whether the commits answer an explicit owner request for a change.
+
+    'fix' and 'instruct' carry the owner's own words, so their commits may
+    touch the paths the repository config protects. A review ('review',
+    'update', 'carry') commits fixes nobody asked for, so it may not.
+    """
+    return command in ("fix", "instruct")
+
+
 def can_propose_learning(command: str) -> bool:
     """Whether the given command allows proposing playbook/lesson updates.
 

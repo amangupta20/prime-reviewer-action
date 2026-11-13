@@ -102,6 +102,12 @@ class CommandRoutingTests(unittest.TestCase):
             self.assertTrue(command_routing.can_push_commits(cmd))
             self.assertTrue(command_routing.can_propose_learning(cmd))
 
+    def test_only_owner_requests_open_protected_paths(self):
+        for cmd in ("fix", "instruct"):
+            self.assertTrue(command_routing.owner_asked_for_changes(cmd))
+        for cmd in ("", "review", "update", "carry", "ask", "unknown"):
+            self.assertFalse(command_routing.owner_asked_for_changes(cmd))
+
 
 if __name__ == "__main__":
     unittest.main()
