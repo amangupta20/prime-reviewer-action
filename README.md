@@ -76,6 +76,13 @@ The action parses `/prime` comments on pull requests and review threads:
 - `/prime fix <instruction>`: implements a requested code fix and pushes checked commits.
 - `/prime <natural instruction>`: backwards-compatible natural instruction.
 
+`protected` paths are closed to commits the reviewer makes on its own: a
+review, a re-review after a push, or its carried fixes. A `/prime fix` or
+natural `/prime <instruction>` is the owner's own request, so its commits may
+change them. `.github/` is closed to every run. The run's environment carries
+`PRIME_OWNER_MAY_OPEN_PROTECTED` (`true` or `false`) so the private core can
+tell the two cases apart.
+
 A strict `/prime` token boundary is enforced: commands like `/primer` are rejected.
 Instruction runs (`ask`, `fix`, `instruct`) continue the PR's saved session and preserve
 existing gate blockers from earlier review runs.

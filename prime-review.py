@@ -157,7 +157,10 @@ APPROVE_CLEAN = os.environ.get("APPROVE_CLEAN") == "true"
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
 BLOCKING_SECTIONS = set(CONFIG.get("blocking_sections", []))
 
+# Workflows are the gate itself: no run may change them.
+ALWAYS_DENY = re.compile("^\\.github/")
 # Paths the reviewer may never change by itself; always includes workflows.
+# An owner's fix or instruction may change the configured ones (check_and_push).
 DENY = re.compile("|".join(["^\\.github/"] + list(CONFIG.get("protected", []))))
 
 
@@ -477,6 +480,8 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
         "LAST": ctx.get("last") or ctx["base"],
         "PRIME_RULES": " ".join(CONFIG.get("rules", ["AGENTS.md"])),
         "PRIME_PROTECTED": " ".join(CONFIG.get("protected", [])),
+        "PRIME_OWNER_MAY_OPEN_PROTECTED": (
+            "true" if command_routing.owner_asked_for_changes(command) else "false"),
         "PRIME_FIX_CHECK": CONFIG.get("fix_check", ""),
         "PRIME_PLAYBOOK": str(playbook),
         "PRIME_REPO": REPO,
@@ -711,7 +716,10 @@ def check_and_push(ctx: dict, prime_head: str, command: str = "") -> tuple[str, 
     # of its folder is still caught; -z keeps unusual names unquoted.
     changed = [p for p in git(["diff", "--no-renames", "--name-only", "-z",
                                f"{ctx['head']}..{new_head}"], PR_DIR).stdout.split("\0") if p]
-    bad = [p for p in changed if DENY.match(p)]
+    # The configured list guards against fixes nobody asked for. A fix or
+    # instruction is the owner's own request, so only workflows stay closed.
+    deny = ALWAYS_DENY if command_routing.owner_asked_for_changes(command) else DENY
+    bad = [p for p in changed if deny.match(p)]
     if bad:
         git(["reset", "--hard", ctx["head"]], PR_DIR)
         return ctx["head"], [], f"its commits touched protected paths ({', '.join(bad)}); not pushed"

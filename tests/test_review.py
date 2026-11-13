@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -284,6 +285,42 @@ fix_check = ""
         (new_head, commits, note), pushes = self._check_and_push(head, prime_head)
         self.assertEqual((new_head, pushes), (head, []))
         self.assertIn('iac/main.tf', note)
+
+    def _edit_protected(self, path):
+        # Each call starts from a fresh pull request, so one test can try several commands.
+        for used in (self.work / 'pr', self.work / 'copy', Path(self.env['PRIME_JAIL']) / 'out'):
+            shutil.rmtree(used, ignore_errors=True)
+        def edit(work, g):
+            (work / path).parent.mkdir(parents=True, exist_ok=True)
+            (work / path).write_text('changed\n')
+            g(work, 'add', path)
+        return self._pr_with_bundle(edit)
+
+    def test_review_commits_to_a_protected_path_are_not_pushed(self):
+        for command in ('', 'review', 'update', 'carry'):
+            with self.subTest(command=command):
+                head, prime_head = self._edit_protected('iac/main.tf')
+                (new_head, commits, note), pushes = self._check_and_push(
+                    head, prime_head, command=command)
+                self.assertEqual((new_head, pushes), (head, []))
+                self.assertIn('iac/main.tf', note)
+
+    def test_owner_instruction_may_change_a_protected_path(self):
+        for command in ('fix', 'instruct'):
+            with self.subTest(command=command):
+                head, prime_head = self._edit_protected('iac/main.tf')
+                (new_head, commits, note), pushes = self._check_and_push(
+                    head, prime_head, command=command)
+                self.assertEqual((new_head, note, len(pushes)), (prime_head, '', 1))
+
+    def test_owner_instruction_cannot_change_workflows(self):
+        for command in ('fix', 'instruct'):
+            with self.subTest(command=command):
+                head, prime_head = self._edit_protected('.github/workflows/ci.yml')
+                (new_head, commits, note), pushes = self._check_and_push(
+                    head, prime_head, command=command)
+                self.assertEqual((new_head, pushes), (head, []))
+                self.assertIn('.github/workflows/ci.yml', note)
 
     def test_ask_command_cannot_push_even_with_commits_bundle(self):
         def edit(work, g):
