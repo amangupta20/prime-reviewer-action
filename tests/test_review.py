@@ -244,7 +244,7 @@ fix_check = ""
                 (out / 'result.json').write_text('{"verdict": "approve"}')
             return FakeProc()
 
-        with patch.dict(g, {'OUT': out, 'prepare_jail': lambda: None,
+        with patch.dict(g, {'OUT': out, 'prepare_jail': lambda *a: None,
                             'as_prime': lambda *a, **k: None,
                             'collect_from_jail': lambda *a, **k: 'head',
                             'stream_progress': lambda proc, started: 'last words',
@@ -335,6 +335,176 @@ fix_check = ""
     def test_ask_command_does_not_propose_learning(self):
         fn = self.mod['propose_learning']
         self.assertEqual(fn(command="ask"), "")
+
+    # ---- /prime resolve: merging the base branch ----
+
+    def _pr_behind_base(self, base_change, pr_change=None):
+        """A PR branch `feature` and a base `main` that moved on after it.
+
+        Returns (pr checkout, Prime's copy, PR head, base tip, git helper).
+        Prime's copy has the base as origin/main, as prepare_jail gives it.
+        """
+        for used in (self.work / 'pr', self.work / 'copy', Path(self.env['PRIME_JAIL']) / 'out'):
+            shutil.rmtree(used, ignore_errors=True)
+        pr = self.work / 'pr'
+        def g(cwd, *args, check=True):
+            return subprocess.run(['git', *args], cwd=cwd, check=check,
+                                  capture_output=True, text=True).stdout.strip()
+        pr.mkdir()
+        g(pr, 'init', '-q', '-b', 'main')
+        g(pr, 'config', 'user.email', 'test@example.com')
+        g(pr, 'config', 'user.name', 'Test')
+        for path, text in {'iac/main.tf': 'x\n', 'notes.md': 'a\n',
+                           '.github/workflows/ci.yml': 'on: push\n'}.items():
+            (pr / path).parent.mkdir(parents=True, exist_ok=True)
+            (pr / path).write_text(text)
+        g(pr, 'add', '.')
+        g(pr, 'commit', '-qm', 'Start')
+        g(pr, 'switch', '-q', '-c', 'feature')
+        (pr_change or (lambda d: (d / 'feature.md').write_text('f\n')))(pr)
+        g(pr, 'add', '-A')
+        g(pr, 'commit', '-qm', 'Feature')
+        g(pr, 'switch', '-q', 'main')
+        base_change(pr)
+        g(pr, 'add', '-A')
+        g(pr, 'commit', '-qm', 'Base moved on')
+        base_tip = g(pr, 'rev-parse', 'HEAD')
+        g(pr, 'switch', '-q', 'feature')
+        g(pr, 'update-ref', 'refs/remotes/origin/main', base_tip)
+        head = g(pr, 'rev-parse', 'HEAD')
+        work = self.work / 'copy'
+        g(self.work, 'clone', '-q', str(pr), str(work))
+        g(work, 'config', 'user.email', 'test@example.com')
+        g(work, 'config', 'user.name', 'Test')
+        g(work, 'switch', '-q', 'feature')
+        return pr, work, head, base_tip, g
+
+    def _bundle(self, work, head, g):
+        out = Path(self.env['PRIME_JAIL']) / 'out'
+        out.mkdir(parents=True, exist_ok=True)
+        g(work, 'bundle', 'create', '-q', str(out / 'commits.bundle'), 'HEAD', f'^{head}')
+        return g(work, 'rev-parse', 'HEAD')
+
+    def _merge(self, work, g, commit, resolve=None):
+        """Merge `commit` as Prime would, write `resolve` files, commit the merge."""
+        g(work, 'merge', '--no-ff', '--no-edit', commit, check=False)
+        for path, text in (resolve or {}).items():
+            (work / path).parent.mkdir(parents=True, exist_ok=True)
+            (work / path).write_text(text)
+            g(work, 'add', path)
+        g(work, 'commit', '-qam', 'Merge base', check=False)
+
+    def _push_resolved(self, head, base_tip, prime_head, command='resolve'):
+        fn = self.mod['check_and_push']
+        real_git = fn.__globals__['git']
+        pushes = []
+        def fake_git(args, cwd, **kwargs):
+            if args[0] == 'push':
+                pushes.append(args)
+                return subprocess.CompletedProcess([], 0, '', '')
+            return real_git(args, cwd, **kwargs)
+        ctx = {'head': head, 'base_tip': base_tip,
+               'pr': {'state': 'open', 'head': {'ref': 'feature'}}}
+        with patch.dict(fn.__globals__, git=fake_git):
+            return fn(ctx, prime_head, command=command), pushes
+
+    def _conflict_on(self, path):
+        """The base and the PR both change `path`."""
+        return (lambda d: (d / path).write_text('base side\n'),
+                lambda d: (d / path).write_text('pr side\n'))
+
+    def test_resolved_conflict_is_pushed_as_one_merge(self):
+        base_change, pr_change = self._conflict_on('notes.md')
+        pr, work, head, base_tip, g = self._pr_behind_base(base_change, pr_change)
+        self._merge(work, g, base_tip, {'notes.md': 'pr side\nbase side\n'})
+        prime_head = self._bundle(work, head, g)
+        (new_head, commits, note), pushes = self._push_resolved(head, base_tip, prime_head)
+        self.assertEqual((new_head, note, len(pushes)), (prime_head, '', 1))
+        self.assertEqual(len(commits), 1)
+        self.assertIn('Merge base', commits[0])
+
+    def test_protected_changes_the_base_brought_in_are_not_counted(self):
+        def base_change(d):
+            (d / '.github/workflows/ci.yml').write_text('on: pull_request\n')
+            (d / 'iac/main.tf').write_text('y\n')
+        pr, work, head, base_tip, g = self._pr_behind_base(base_change)
+        self._merge(work, g, base_tip)
+        prime_head = self._bundle(work, head, g)
+        (new_head, commits, note), pushes = self._push_resolved(head, base_tip, prime_head)
+        self.assertEqual((new_head, note, len(pushes)), (prime_head, '', 1))
+
+    def test_resolving_a_workflow_conflict_is_not_pushed(self):
+        base_change, pr_change = self._conflict_on('.github/workflows/ci.yml')
+        pr, work, head, base_tip, g = self._pr_behind_base(base_change, pr_change)
+        self._merge(work, g, base_tip, {'.github/workflows/ci.yml': 'pr side\n'})
+        prime_head = self._bundle(work, head, g)
+        (new_head, commits, note), pushes = self._push_resolved(head, base_tip, prime_head)
+        self.assertEqual((new_head, pushes), (head, []))
+        self.assertIn('.github/workflows/ci.yml', note)
+
+    def test_an_extra_workflow_edit_inside_the_merge_is_not_pushed(self):
+        pr, work, head, base_tip, g = self._pr_behind_base(
+            lambda d: (d / 'notes.md').write_text('b\n'))
+        self._merge(work, g, base_tip, {'.github/workflows/ci.yml': 'on: workflow_dispatch\n'})
+        g(work, 'commit', '-q', '--amend', '--no-edit', '-a')
+        prime_head = self._bundle(work, head, g)
+        (new_head, commits, note), pushes = self._push_resolved(head, base_tip, prime_head)
+        self.assertEqual((new_head, pushes), (head, []))
+        self.assertIn('.github/workflows/ci.yml', note)
+
+    def test_resolving_a_configured_protected_path_is_the_owners_request(self):
+        base_change, pr_change = self._conflict_on('iac/main.tf')
+        pr, work, head, base_tip, g = self._pr_behind_base(base_change, pr_change)
+        self._merge(work, g, base_tip, {'iac/main.tf': 'pr side\nbase side\n'})
+        prime_head = self._bundle(work, head, g)
+        (new_head, commits, note), pushes = self._push_resolved(head, base_tip, prime_head)
+        self.assertEqual((new_head, note, len(pushes)), (prime_head, '', 1))
+
+    def test_a_merge_of_anything_but_the_base_tip_is_not_pushed(self):
+        pr, work, head, base_tip, g = self._pr_behind_base(
+            lambda d: (d / 'notes.md').write_text('b\n'))
+        g(work, 'switch', '-q', '-c', 'side', base_tip)
+        (work / 'side.md').write_text('s\n')
+        g(work, 'add', 'side.md')
+        g(work, 'commit', '-qm', 'Side')
+        side = g(work, 'rev-parse', 'HEAD')
+        g(work, 'switch', '-q', 'feature')
+        self._merge(work, g, side)
+        prime_head = self._bundle(work, head, g)
+        (new_head, commits, note), pushes = self._push_resolved(head, base_tip, prime_head)
+        self.assertEqual((new_head, pushes), (head, []))
+        self.assertIn("base branch's tip", note)
+
+    def test_a_merge_with_the_pr_as_second_parent_is_not_pushed(self):
+        pr, work, head, base_tip, g = self._pr_behind_base(
+            lambda d: (d / 'notes.md').write_text('b\n'))
+        g(work, 'switch', '-q', '--detach', base_tip)
+        self._merge(work, g, head)
+        prime_head = self._bundle(work, head, g)
+        (new_head, commits, note), pushes = self._push_resolved(head, base_tip, prime_head)
+        self.assertEqual((new_head, pushes), (head, []))
+        self.assertIn("do not continue", note)
+
+    def test_other_commands_may_not_merge(self):
+        for command in ('review', 'update', 'carry', 'fix', 'instruct'):
+            with self.subTest(command=command):
+                pr, work, head, base_tip, g = self._pr_behind_base(
+                    lambda d: (d / 'notes.md').write_text('b\n'))
+                self._merge(work, g, base_tip)
+                prime_head = self._bundle(work, head, g)
+                (new_head, commits, note), pushes = self._push_resolved(
+                    head, base_tip, prime_head, command=command)
+                self.assertEqual((new_head, pushes), (head, []))
+                self.assertIn('only /prime resolve may add a merge', note)
+
+    def test_a_rebase_onto_the_base_is_dropped(self):
+        pr, work, head, base_tip, g = self._pr_behind_base(
+            lambda d: (d / 'notes.md').write_text('b\n'))
+        g(work, 'rebase', '-q', base_tip)
+        prime_head = self._bundle(work, head, g)
+        (new_head, commits, note), pushes = self._push_resolved(head, base_tip, prime_head)
+        self.assertEqual((new_head, pushes), (head, []))
+        self.assertIn('rewrote history', note)
 
     def test_parse_mode_routing(self):
         saved = self.work / 'state/sessions/homelab/pr-7'
