@@ -37,6 +37,25 @@ class CommandRoutingTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(command_routing.parse_command(text), expected)
 
+    def test_resolve_commands(self):
+        cases = [
+            ("/prime resolve", ("resolve", "", "")),
+            ("/prime resolve: keep main's wording in README", ("resolve", "keep main's wording in README", "")),
+            ("/prime resolve   prefer ours  ", ("resolve", "prefer ours", "")),
+            ("/prime resolver please", ("instruct", "resolver please", "")),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(command_routing.parse_command(text), expected)
+
+    def test_only_resolve_may_merge_the_base(self):
+        self.assertTrue(command_routing.may_merge_base("resolve"))
+        for command in ("review", "update", "carry", "fix", "instruct", "ask", "unknown", ""):
+            with self.subTest(command=command):
+                self.assertFalse(command_routing.may_merge_base(command))
+        self.assertEqual(command_routing.command_to_mode("resolve"), "instruct")
+        self.assertTrue(command_routing.can_push_commits("resolve"))
+
     def test_ask_commands(self):
         cases = [
             ("/prime ask why is this mutex necessary?", ("ask", "why is this mutex necessary?", "")),

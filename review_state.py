@@ -38,5 +38,6 @@ def status_body(state, run_url, head=None, reviewed=None, ci=None, note=None):
         lines.append(f"CI at run start: {ci}")
     if note:
         lines.append(note)
-    lines.append("Commands: `/prime review`, `/prime ask <question>`, `/prime fix <request>`")
+    lines.append("Commands: `/prime review`, `/prime ask <question>`, `/prime fix <request>`, "
+                 "`/prime resolve`")
     return "\n\n".join(lines)

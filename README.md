@@ -74,6 +74,8 @@ The action parses `/prime` comments on pull requests and review threads:
 - `/prime review <focus>`: triggers a full review focused on the requested topic (e.g. `/prime review security`).
 - `/prime ask <question>`: read-only question answering. Prime answers without making code changes or pushing commits, and without proposing playbook changes.
 - `/prime fix <instruction>`: implements a requested code fix and pushes checked commits.
+- `/prime resolve [<notes>]`: merges the base branch's current tip into the PR and resolves
+  any conflicts, then pushes the merge. Optional notes say how to resolve a conflict.
 - `/prime <natural instruction>`: backwards-compatible natural instruction.
 
 `protected` paths are closed to commits the reviewer makes on its own: a
@@ -83,8 +85,25 @@ change them. `.github/` is closed to every run. The run's environment carries
 `PRIME_OWNER_MAY_OPEN_PROTECTED` (`true` or `false`) so the private core can
 tell the two cases apart.
 
+Only `/prime resolve` may push a merge. Prime's copy of the PR then also holds
+the base branch (`PRIME_BASE_REF`, tip `PRIME_BASE_TIP`), and before pushing the
+action checks that:
+
+- Prime's commits continue the PR head by first parents, so a rebase, or a
+  merge with the PR as the second parent, is refused;
+- every merge among Prime's own commits has exactly two parents, the second
+  being the base tip the run started from;
+- the protected-path check covers what Prime's result changes against a plain
+  merge of the PR head and the base tip (`git merge-tree`), not the base's own
+  changes. A conflict Prime resolves in `.github/`, or any edit it adds there,
+  is refused; `protected` paths are open as for `/prime fix`.
+
+The push is a commit by the reviewer, so the next `ai review` run re-reviews
+the merged PR. Tested offline only (2026-11-17); a live `/prime resolve` is
+UNTESTED.
+
 A strict `/prime` token boundary is enforced: commands like `/primer` are rejected.
-Instruction runs (`ask`, `fix`, `instruct`) continue the PR's saved session and preserve
+Instruction runs (`ask`, `fix`, `resolve`, `instruct`) continue the PR's saved session and preserve
 existing gate blockers from earlier review runs.
 
 ## CI evidence

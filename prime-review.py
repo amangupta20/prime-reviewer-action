@@ -9,7 +9,8 @@ Steps:
 1. Work out the mode: `review` (PR opened, or `/prime` / `/prime review ...`),
    `update` (the owner pushed to a reviewed PR), `carry` (the reviewer's own
    fix commits arrived: reuse its verdict, no model call), or `instruct`
-   (`/prime <anything else>`).
+   (`/prime <anything else>`; `/prime ask`, `/prime fix` and `/prime resolve`
+   run in this mode too).
 2. Check out the PR head, restore this PR's saved session from the private
    repo's `state` branch.
 3. Run Prime as its own Linux user on fresh copies of the PR, rules,
@@ -17,7 +18,9 @@ Steps:
    GitHub token or storage keys, and cannot change files this script trusts.
 4. Take its commits back as a bundle, check them (allowed paths, the
    configured check from the default branch, run as Prime's user) and push
-   them with the App token.
+   them with the App token. Only `/prime resolve` may add a merge, and only
+   of the base branch's tip; the protected-path check then covers what its
+   resolution changed against a plain merge, not what the base brought in.
 5. Post a review: suggestions and design comments on diff lines, the rest in
    the summary. In instruct mode, reply to the comment. With `approve-clean`,
    approve a commit that reviewed clean and withdraw that approval otherwise.
@@ -383,13 +386,15 @@ def checkout_pr() -> dict:
     git(["checkout", "--quiet", "-b", "prime-work", "FETCH_HEAD"], PR_DIR)
     git(["fetch", "--quiet", "origin",
          f"refs/heads/{pr['base']['ref']}:refs/remotes/origin/{pr['base']['ref']}"], PR_DIR, auth=True)
-    base = git(["merge-base", "HEAD", f"origin/{pr['base']['ref']}"], PR_DIR).stdout.strip()
+    base_ref = f"origin/{pr['base']['ref']}"
+    base = git(["merge-base", "HEAD", base_ref], PR_DIR).stdout.strip()
+    base_tip = git(["rev-parse", base_ref], PR_DIR).stdout.strip()
     head = git(["rev-parse", "HEAD"], PR_DIR).stdout.strip()
     bot = gh_api(f"users/{os.environ['APP_SLUG']}%5Bbot%5D")
     git(["config", "user.name", f"{os.environ['APP_SLUG']}[bot]"], PR_DIR)
     git(["config", "user.email",
          f"{bot['id']}+{os.environ['APP_SLUG']}[bot]@users.noreply.github.com"], PR_DIR)
-    return {"pr": pr, "base": base, "head": head}
+    return {"pr": pr, "base": base, "head": head, "base_ref": base_ref, "base_tip": base_tip}
 
 
 def checkout_state() -> None:
@@ -461,7 +466,7 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
             SESSION.mkdir(parents=True)
     before = line_counts(SESSION)
 
-    prepare_jail()
+    prepare_jail(ctx["base_ref"] if command == "resolve" else "")
     playbook = JAIL / "agent" / PLAYBOOK.relative_to(AGENT)
     ci_context_str = json.dumps(ci_data) if ci_data else "{}"
     env = {
@@ -486,6 +491,9 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
         "PRIME_PLAYBOOK": str(playbook),
         "PRIME_REPO": REPO,
     }
+    if command == "resolve":
+        env["PRIME_BASE_REF"] = ctx["base_ref"]
+        env["PRIME_BASE_TIP"] = ctx["base_tip"]
     if command == "ask":
         prompt = (f"The owner asked a question on pull request #{PR}: read it from "
                   "$PRIME_INSTRUCTION. Answer it as a read-only response under your core's "
@@ -495,6 +503,17 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
         prompt = (f"The owner requested a fix on pull request #{PR}: read it from "
                   "$PRIME_INSTRUCTION. Implement the requested fix under your core's rules, "
                   "and write $PRIME_OUT/result.json with the reply filled in.")
+    elif command == "resolve":
+        prompt = (f"The owner asked you to bring pull request #{PR} up to date with its base "
+                  "branch $PRIME_BASE_REF and resolve any merge conflicts. Merge exactly "
+                  "$PRIME_BASE_TIP with `git merge --no-ff $PRIME_BASE_TIP`; never rebase, "
+                  "amend or reset, since rewritten history is dropped. Resolve each conflict "
+                  "so both sides' intent survives, read the files around it to check the "
+                  "result still holds together, change nothing the merge does not need, and "
+                  "commit the merge. A conflict in .github/ cannot be pushed: leave the merge "
+                  "uncommitted and say so. The owner's notes, if any, are in "
+                  "$PRIME_INSTRUCTION. Write $PRIME_OUT/result.json with the reply listing "
+                  "each conflicted file and how you resolved it.")
     elif mode == "review":
         prompt = (f"Review pull request #{PR} (diff $BASE..$HEAD). Follow your core and "
                   "your playbook skill, fix level 1 findings as commits, and write "
@@ -570,9 +589,10 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
             "started": started, "lines_before": lines_before, "stdout": final_text}
 
 
-def prepare_jail() -> None:
+def prepare_jail(base_ref: str = "") -> None:
     """Fresh copies of what Prime may read or change. The rules stay owned by
-    this user, so Prime can read them but not change them."""
+    this user, so Prime can read them but not change them. With `base_ref`
+    (`/prime resolve`), Prime's copy also gets the base branch to merge."""
     stop_prime_processes()
     sudo(["rm", "-rf", "--one-file-system", str(JAIL)])
     sudo(["install", "-d", "-m", "755", "-o", str(os.getuid()), "-g", str(os.getgid()),
@@ -587,6 +607,10 @@ def prepare_jail() -> None:
     git(["clone", "--quiet", "--no-hardlinks", str(PR_DIR), str(JAIL / "work")], WORK)
     for key in ("user.name", "user.email"):
         git(["config", key, git(["config", key], PR_DIR).stdout.strip()], JAIL / "work")
+    if base_ref:
+        # A clone takes only branches; the base is a remote-tracking ref here.
+        git(["fetch", "--quiet", "--no-tags", str(PR_DIR),
+             f"refs/remotes/{base_ref}:refs/remotes/{base_ref}"], JAIL / "work")
     for d in ("out", "tmp"):
         (JAIL / d).mkdir()
     give_to_prime(*(JAIL / d for d in ("agent", "session", "work", "out", "tmp")))
@@ -712,10 +736,15 @@ def check_and_push(ctx: dict, prime_head: str, command: str = "") -> tuple[str, 
            check=False).returncode != 0:
         return ctx["head"], [], "the reviewer rewrote history; its commits were dropped"
     git(["reset", "--quiet", "--hard", new_head], PR_DIR)
+    merge_note = check_merges(ctx, new_head, command)
+    if merge_note:
+        git(["reset", "--hard", ctx["head"]], PR_DIR)
+        return ctx["head"], [], merge_note
     # --no-renames lists both sides of a move, so moving a protected file out
     # of its folder is still caught; -z keeps unusual names unquoted.
     changed = [p for p in git(["diff", "--no-renames", "--name-only", "-z",
-                               f"{ctx['head']}..{new_head}"], PR_DIR).stdout.split("\0") if p]
+                               changes_from(ctx, new_head, command), new_head],
+                              PR_DIR).stdout.split("\0") if p]
     # The configured list guards against fixes nobody asked for. A fix or
     # instruction is the owner's own request, so only workflows stay closed.
     deny = ALWAYS_DENY if command_routing.owner_asked_for_changes(command) else DENY
@@ -731,8 +760,59 @@ def check_and_push(ctx: dict, prime_head: str, command: str = "") -> tuple[str, 
         return ctx["head"], [], "the pull request is closed; commits not pushed"
     git(["push", "--quiet", "origin", f"HEAD:refs/heads/{ctx['pr']['head']['ref']}"],
         PR_DIR, auth=True)
-    commits = git(["log", "--format=%h %s", f"{ctx['head']}..{new_head}"], PR_DIR).stdout.splitlines()
+    # --first-parent: a merge lists itself, not every base commit it brought in.
+    commits = git(["log", "--first-parent", "--format=%h %s", f"{ctx['head']}..{new_head}"],
+                  PR_DIR).stdout.splitlines()
     return new_head, commits, ""
+
+
+def is_ancestor(old: str, new: str) -> bool:
+    return git(["merge-base", "--is-ancestor", old, new], PR_DIR, check=False).returncode == 0
+
+
+def check_merges(ctx: dict, new_head: str, command: str) -> str:
+    """'' when the shape of Prime's commits may be pushed, else why not.
+
+    Prime's line must run from the PR head by first parents, so its commits
+    sit on top of the PR. Only `/prime resolve` may merge, and only the base
+    branch's tip as the second parent: that is the one source of commits
+    the owner asked to bring in.
+    """
+    first_parents = git(["rev-list", "--first-parent", new_head], PR_DIR).stdout.split()
+    if ctx["head"] not in first_parents:
+        return "its commits do not continue the pull request's head; not pushed"
+    exclude = [f"^{ctx['head']}"]
+    if command_routing.may_merge_base(command):
+        exclude.append(f"^{ctx['base_tip']}")
+    merges = git(["rev-list", "--merges", "--parents", new_head, *exclude],
+                 PR_DIR).stdout.splitlines()
+    if merges and not command_routing.may_merge_base(command):
+        return "only /prime resolve may add a merge; not pushed"
+    for line in merges:
+        parents = line.split()[1:]
+        if len(parents) != 2 or parents[1] != ctx["base_tip"]:
+            return (f"a merge did not take the base branch's tip "
+                    f"({ctx['base_tip'][:7]}) as its second parent; not pushed")
+    return ""
+
+
+def changes_from(ctx: dict, new_head: str, command: str) -> str:
+    """The tree Prime's changes are measured from for the protected-path check.
+
+    Normally the PR head. When `/prime resolve` merged the base, a plain merge
+    of the PR head and the base tip (conflicted files keep their markers), so
+    what the base brought in is not counted as Prime's, while every conflict
+    Prime resolved and every other edit it made is.
+    """
+    if not (command_routing.may_merge_base(command)
+            and is_ancestor(ctx["base_tip"], new_head)):
+        return ctx["head"]
+    # Exit 1 means the plain merge has conflicts; its tree is still written.
+    r = git(["merge-tree", "--write-tree", ctx["head"], ctx["base_tip"]], PR_DIR, check=False)
+    tree = r.stdout.split("\n", 1)[0].strip()
+    if r.returncode not in (0, 1) or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        raise RuntimeError("git merge-tree could not merge the PR head and the base tip")
+    return tree
 
 
 def run_fix_check() -> bool:

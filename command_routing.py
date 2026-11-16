@@ -4,6 +4,7 @@ Parses /prime comments and pull request triggers into explicit commands:
 - review: full review (or focused review if focus is provided)
 - ask: read-only question answering (no code push, no lesson updates)
 - fix: targeted mechanical or requested code fix
+- resolve: merge the base branch into the PR and resolve its conflicts
 - instruct: backwards-compatible natural instruction
 - update: owner pushed commits to an open PR
 - carry: reviewer's own fixes arrived
@@ -22,6 +23,7 @@ def parse_command(body: str) -> tuple[str, str, str]:
       /prime review <focus>      -> command='review', instruction='', focus='<focus>'
       /prime ask <question>      -> command='ask', instruction='<question>', focus=''
       /prime fix <instruction>   -> command='fix', instruction='<instruction>', focus=''
+      /prime resolve [<notes>]   -> command='resolve', instruction='<notes>', focus=''
       /prime <natural text>      -> command='instruct', instruction='<natural text>', focus=''
       /prime                     -> command='review', instruction='', focus=''
 
@@ -67,6 +69,12 @@ def parse_command(body: str) -> tuple[str, str, str]:
         instruction = instruction.lstrip(":").strip()
         return "fix", instruction, ""
 
+    m_resolve = re.match(r"(?is)^resolve\b(?:\s*:\s*|\s+)?(.*)$", text)
+    if m_resolve:
+        notes = m_resolve.group(1).strip()
+        notes = notes.lstrip(":").strip()
+        return "resolve", notes, ""
+
     return "instruct", text, ""
 
 
@@ -74,9 +82,9 @@ def command_to_mode(command: str) -> str:
     """Map explicit command to existing PRIME_MODE semantics.
 
     PRIME_MODE preserves 'review', 'update', and 'instruct' (or 'carry').
-    'ask' and 'fix' run under 'instruct' mode while exposing PRIME_COMMAND.
+    'ask', 'fix' and 'resolve' run under 'instruct' mode while exposing PRIME_COMMAND.
     """
-    if command in ("ask", "fix", "instruct"):
+    if command in ("ask", "fix", "resolve", "instruct"):
         return "instruct"
     if command == "update":
         return "update"
@@ -96,11 +104,21 @@ def can_push_commits(command: str) -> bool:
 def owner_asked_for_changes(command: str) -> bool:
     """Whether the commits answer an explicit owner request for a change.
 
-    'fix' and 'instruct' carry the owner's own words, so their commits may
-    touch the paths the repository config protects. A review ('review',
-    'update', 'carry') commits fixes nobody asked for, so it may not.
+    'fix', 'instruct' and 'resolve' carry the owner's own request, so their
+    commits may touch the paths the repository config protects (for
+    'resolve', only where its resolution differs from a plain merge). A
+    review ('review', 'update', 'carry') commits fixes nobody asked for, so it
+    may not.
     """
-    return command in ("fix", "instruct")
+    return command in ("fix", "instruct", "resolve")
+
+
+def may_merge_base(command: str) -> bool:
+    """Whether the command's commits may include a merge of the base branch.
+
+    Only 'resolve' merges; every other command must add plain commits.
+    """
+    return command == "resolve"
 
 
 def can_propose_learning(command: str) -> bool:
