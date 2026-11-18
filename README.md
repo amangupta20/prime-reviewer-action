@@ -59,6 +59,12 @@ branch. `fix_check` is a trusted shell command run in the pull-request working
 directory; never use it to execute scripts added or changed by the pull request.
 Empty check and blocking-section values explicitly opt out; missing fields fail.
 
+Optional: `thinking` sets Prime's reasoning level (`off`, `minimal`, `low`,
+`medium`, `high`, `xhigh` or `max`; default `high`). Any other value fails the
+run. Each run's metadata and job summary record the level used. Prime 0.10.2
+listed these levels in `prime-agent --help` and ran `glm-5.3` at `max`
+(2026-11-18); a full review at a level other than `high` is UNTESTED.
+
 With `state-backend: b2`, sessions and traces live in B2 (see "B2 runtime
 storage"). Without B2 inputs, sessions use `sessions/<repo>/pr-<n>/` on the
 private `state` branch, with a read fallback for historical homelab sessions.

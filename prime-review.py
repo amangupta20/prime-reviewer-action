@@ -153,6 +153,12 @@ if not PLAYBOOK.is_dir() or not (PLAYBOOK / "SKILL.md").is_file():
 if not PLAYBOOK.resolve().is_relative_to((AGENT / "repos" / REPO_NAME).resolve()):
     raise SystemExit("playbook must live inside this repository's config folder")
 MODEL = os.environ.get("PRIME_MODEL") or CONFIG.get("model", "deepseek-v4.1-flash")
+# Prime's reasoning level, from the trusted config like the model. Prime 0.10.2
+# accepts these levels; "high" was the fixed value before this setting existed.
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+THINKING = CONFIG.get("thinking", "high")
+if THINKING not in THINKING_LEVELS:
+    raise SystemExit(f"thinking must be one of {', '.join(THINKING_LEVELS)}: {THINKING!r}")
 ACTION = os.environ.get("EVENT_ACTION", "")
 SENDER = os.environ.get("SENDER", "")
 GATE = EVENT == "pull_request_target"
@@ -535,7 +541,7 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
         if ci_summary_text:
             prompt += f"\n\n{ci_summary_text}"
     cmd = [str(PRIME), "-p", "--mode", "json", "--session-dir", str(JAIL / "session"),
-           "--provider", "opencode-go", "--model", MODEL, "--thinking", "high",
+           "--provider", "opencode-go", "--model", MODEL, "--thinking", THINKING,
            "--skill", str(playbook)]
     # The model key is the one credential Prime gets. It travels through
     # sudo's preserved environment, never the command line, which any local
@@ -560,7 +566,7 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
             return -9, text
 
     started = time.time()
-    log(f"running Prime ({mode}, resume={resume}, model {MODEL})")
+    log(f"running Prime ({mode}, resume={resume}, model {MODEL}, thinking {THINKING})")
     code, final_text = attempt(prompt, resume)
     # The model sometimes ends its turn announcing its next step instead of taking it, which
     # exits 0 with no result. Its session is intact, so ask once; a second miss fails the run.
@@ -1139,7 +1145,7 @@ def write_summary(meta: dict) -> None:
         ("Tokens in / out / cache read",
          f"{u.get('input', 0):,} / {u.get('output', 0):,} / {u.get('cache_read', 0):,}"),
         ("Cost (Prime's estimate)", f"${u.get('cost', 0):.4f}"),
-        ("Model", meta.get("model")), ("Trace", f"`{trace_label}`"),
+        ("Model", meta.get("model")), ("Thinking", meta.get("thinking")), ("Trace", f"`{trace_label}`"),
     ]
     if meta.get("ci_summary"):
         rows.append(("CI status", meta["ci_summary"]))
@@ -1288,7 +1294,7 @@ def main() -> int:
         "run_id": RUN_ID, "run_url": RUN_URL, "repo": REPO, "pr": int(PR), "mode": mode,
         "command": command,
         "config_ref": CONFIG_REF, "config_commit": config_commit,
-        "event": EVENT, "action": ACTION, "model": MODEL,
+        "event": EVENT, "action": ACTION, "model": MODEL, "thinking": THINKING,
         "prime_version": os.environ.get("PRIME_AGENT_VERSION"),
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(res["started"])),
         "duration_s": res["duration"], "prime_exit": res["exit"],
