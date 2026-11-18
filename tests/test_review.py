@@ -112,6 +112,18 @@ fix_check = ""
         with self.assertRaisesRegex(SystemExit, 'blocking_sections'):
             self.load()
 
+    def test_thinking_defaults_to_high_and_reads_config(self):
+        self.assertEqual(self.mod['THINKING'], 'high')
+        config = self.repo / 'config.toml'
+        config.write_text(config.read_text() + 'thinking = "max"\n')
+        self.assertEqual(self.load()['THINKING'], 'max')
+
+    def test_unknown_thinking_level_fails(self):
+        config = self.repo / 'config.toml'
+        config.write_text(config.read_text() + 'thinking = "ultra"\n')
+        with self.assertRaisesRegex(SystemExit, 'thinking must be one of'):
+            self.load()
+
     def test_protected_paths_always_include_workflows(self):
         deny = self.mod['DENY']
         for path in ['.github/workflows/test.yml', 'iac/vm.tf', 'AGENTS.md']:
