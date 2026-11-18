@@ -91,6 +91,16 @@ change them. `.github/` is closed to every run. The run's environment carries
 `PRIME_OWNER_MAY_OPEN_PROTECTED` (`true` or `false`) so the private core can
 tell the two cases apart.
 
+Prime holds no GitHub token, so the action writes the pull request's title and
+description to a read-only file in its sandbox, named by `PRIME_PR_FILE` and
+headed as untrusted data. Before 2026-11-19 Prime could not read the
+description at all.
+
+When the branch moves while Prime works (someone pushed), its push is refused.
+The run then still posts the review, without the fixes and with a note saying
+so; the new push starts another run on the current head. Before 2026-11-19 a
+refused push failed the run and its review was lost.
+
 Only `/prime resolve` may push a merge. Prime's copy of the PR then also holds
 the base branch (`PRIME_BASE_REF`, tip `PRIME_BASE_TIP`), and before pushing the
 action checks that:

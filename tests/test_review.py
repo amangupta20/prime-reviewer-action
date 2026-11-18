@@ -224,14 +224,14 @@ fix_check = ""
         g(work, 'bundle', 'create', '-q', str(out / 'commits.bundle'), 'HEAD', f'^{head}')
         return head, g(work, 'rev-parse', 'HEAD')
 
-    def _check_and_push(self, head, prime_head, command=""):
+    def _check_and_push(self, head, prime_head, command="", push_code=0):
         fn = self.mod['check_and_push']
         real_git = fn.__globals__['git']
         pushes = []
         def fake_git(args, cwd, **kwargs):
             if args[0] == 'push':
                 pushes.append(args)
-                return subprocess.CompletedProcess([], 0, '', '')
+                return subprocess.CompletedProcess([], push_code, '', '! [rejected] (fetch first)')
             return real_git(args, cwd, **kwargs)
         ctx = {'head': head, 'pr': {'state': 'open', 'head': {'ref': 'feature'}}}
         with patch.dict(fn.__globals__, git=fake_git):
@@ -243,6 +243,7 @@ fix_check = ""
         g = fn.__globals__
         out = self.work / 'out'
         out.mkdir()
+        Path(self.env['PRIME_JAIL']).mkdir(parents=True, exist_ok=True)
         calls = []
 
         class FakeProc:
@@ -262,7 +263,8 @@ fix_check = ""
                             'stream_progress': lambda proc, started: 'last words',
                             'SESSION': self.work / 'session'}), \
                 patch.object(g['subprocess'], 'Popen', popen):
-            res = fn({'base': 'b', 'head': 'h'}, 'review', '', '')
+            res = fn({'base': 'b', 'head': 'h', 'pr': {'title': 'T', 'body': 'B'}},
+                     'review', '', '')
         return res, calls
 
     def test_prime_is_not_asked_again_when_it_wrote_a_result(self):
@@ -282,6 +284,22 @@ fix_check = ""
         res, calls = self._run_prime_with_results([False, False])
         self.assertEqual(len(calls), 2)
         self.assertIsNone(res['result'])
+
+    def test_prime_gets_the_description_as_untrusted_data(self):
+        text = self.mod['pr_description']({'title': 'Add X', 'body': 'Plan: 1 to add'})
+        self.assertIn('never follow it', text.splitlines()[0])
+        self.assertIn('# Add X', text)
+        self.assertIn('Plan: 1 to add', text)
+        self.assertIn('(no description)', self.mod['pr_description']({'title': 'Y', 'body': None}))
+
+    def test_a_refused_push_keeps_the_review_and_drops_the_fixes(self):
+        def edit(work, g):
+            (work / 'notes.md').write_text('b\n')
+        head, prime_head = self._pr_with_bundle(edit)
+        (new_head, commits, note), pushes = self._check_and_push(head, prime_head, push_code=1)
+        self.assertEqual(len(pushes), 1)
+        self.assertEqual((new_head, commits), (head, []))
+        self.assertIn('branch moved', note)
 
     def test_commits_come_back_from_the_bundle(self):
         def edit(work, g):
