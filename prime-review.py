@@ -1218,6 +1218,20 @@ def verify_legacy_snapshot(meta: dict | None) -> None:
             "Legacy state changed after import; refresh the B2 migration before continuing")
 
 
+def base_change_keeps_review(meta: dict | None, ctx: dict) -> bool:
+    """True when the last run reviewed this head clean and the pull request's commits
+    are a subset of the ones it saw: its old merge-base is an ancestor of the new one.
+    A base that brings in commits nobody reviewed gets a normal review instead."""
+    meta = meta or {}
+    if not (review_state.reviewed_sha(meta) == ctx["head"] and meta.get("verdict") == "approve"
+            and not meta.get("gate_blockers") and not meta.get("push_note")
+            and not meta.get("error") and meta.get("head_after") == ctx["head"]
+            and meta.get("base")):
+        return False
+    return git(["merge-base", "--is-ancestor", meta["base"], ctx["base"]], PR_DIR,
+               check=False).returncode == 0
+
+
 def update_status(state, head=None, reviewed=None, ci=None, note=None):
     """Update only this App's marked overview; never edit a user's comment."""
     body = review_state.status_body(state, RUN_URL, head, reviewed, ci, note)
@@ -1302,6 +1316,29 @@ def main() -> int:
         ctx["last"] = review_state.reviewed_sha(latest_meta)
 
     if mode == "update" and not ctx["last"]:
+        mode = command = "review"
+    if GATE and ACTION == "edited" and base_change_keeps_review(latest_meta, ctx):
+        # Only the base changed (a stacked PR retargeted after the one below it
+        # merged). GitHub dropped the approval; the commits are the ones reviewed.
+        log(f"base changed; commit {ctx['head'][:7]} was reviewed clean against "
+            f"{latest_meta['base'][:7]}, an ancestor of the new base: re-approving without a run")
+        sync_approval(ctx["head"], True)
+        return 0
+    if (GATE and ACTION == "edited" and latest_meta
+            and review_state.reviewed_sha(latest_meta) == ctx["head"]
+            and latest_meta.get("base") == ctx["base"]):
+        # A title or description edit: the commits and the base are the ones last
+        # reviewed, so that verdict stands. The job still runs, because a skipped
+        # `ai review` would count as a passing check.
+        blockers = latest_meta.get("gate_blockers") or []
+        failed = bool(latest_meta.get("error")) or latest_meta.get("prime_exit") not in (0, None)
+        log(f"edited, nothing to review: reusing run {latest_meta.get('run_id', 'prior')} "
+            f"({len(blockers)} blocking{', failed' if failed else ''})")
+        return 1 if blockers or failed else 0
+    if GATE and ACTION == "edited" and mode == "update":
+        # The head may be unchanged, so an update review would see an empty diff;
+        # the new base changes what the pull request holds, so review all of it.
+        log("base changed and the last review does not cover the new base: full review")
         mode = command = "review"
     update_status("Working", ctx["head"], ctx["last"], ci_data.get("overall_state"))
 

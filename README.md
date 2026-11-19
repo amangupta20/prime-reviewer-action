@@ -39,6 +39,14 @@ A required approval needs the App to have write access to the repository, and
 the ruleset's last-push approval off, because the App may push the last commit.
 A live approval is UNTESTED.
 
+A base change (`pull_request_target` type `edited` with `changes.base`, which
+the caller must list) makes GitHub dismiss approvals but starts no review. On
+that event the action re-approves without running the model when the last run
+reviewed this exact head clean and its merge-base is an ancestor of the new
+one, so no unreviewed commit joined the pull request: a stacked pull request
+retargeted after the one below it merged by fast-forward. Otherwise it runs a
+full review. UNTESTED on GitHub until the first run of a commit that contains it.
+
 ## Private configuration
 
 Required `repos/<repo>/config.toml` fields:

@@ -18,9 +18,14 @@ name: prime review
 # with a model key and a token that can push; that is safe only because the
 # action's first step stops every pull request and comment not from the owner. Keep
 # that guard first in the action.
+#
+# `edited` is there for stacked pull requests: changing the base dismisses the
+# approval, and the action re-approves without a model run when the reviewed
+# commits are unchanged. A title or description edit reuses the last verdict.
+# Do not filter `edited` out at the job: a skipped `ai review` counts as passing.
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
   issue_comment:
     types: [created]
   pull_request_review_comment:

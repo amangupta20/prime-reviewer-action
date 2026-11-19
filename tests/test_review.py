@@ -302,6 +302,35 @@ fix_check = ""
         self.assertEqual(g['describe_stop'](g['LAST_STOP']), 'stop reason error, error: 429: busy')
         self.assertEqual(g['describe_stop']({}), 'no turn seen')
 
+    def _keeps_review(self, meta, ancestor=True):
+        fn = self.load()['base_change_keeps_review']
+        calls = []
+        def fake_git(args, cwd, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0 if ancestor else 1, '', '')
+        with patch.dict(fn.__globals__, git=fake_git):
+            return fn(meta, {'head': 'h', 'base': 'newbase'}), calls
+
+    def test_a_base_change_keeps_a_clean_review_of_the_same_commits(self):
+        meta = {'reviewed_sha': 'h', 'verdict': 'approve', 'gate_blockers': [],
+                'push_note': '', 'error': '', 'head_after': 'h', 'base': 'oldbase'}
+        kept, calls = self._keeps_review(meta)
+        self.assertTrue(kept)
+        self.assertEqual(calls, [['merge-base', '--is-ancestor', 'oldbase', 'newbase']])
+        # A new base that does not contain the old one brings in unreviewed commits.
+        self.assertFalse(self._keeps_review(meta, ancestor=False)[0])
+
+    def test_a_base_change_needs_a_review_unless_the_last_one_approved_this_head(self):
+        good = {'reviewed_sha': 'h', 'verdict': 'approve', 'gate_blockers': [],
+                'push_note': '', 'error': '', 'head_after': 'h', 'base': 'oldbase'}
+        for change in ({'reviewed_sha': 'other'}, {'verdict': 'needs_owner'},
+                       {'gate_blockers': [{'section': 1}]}, {'push_note': 'not pushed'},
+                       {'error': 'X'}, {'head_after': 'pushed'}, {'base': ''}):
+            kept, calls = self._keeps_review({**good, **change})
+            self.assertFalse(kept, change)
+            self.assertEqual(calls, [])
+        self.assertFalse(self._keeps_review(None)[0])
+
     def test_prime_gets_the_description_as_untrusted_data(self):
         text = self.mod['pr_description']({'title': 'Add X', 'body': 'Plan: 1 to add'})
         self.assertIn('never follow it', text.splitlines()[0])
