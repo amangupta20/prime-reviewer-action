@@ -454,6 +454,13 @@ Written only by the prime-reviewer action (`amangupta20/prime-reviewer-action`),
 FINISH_PROMPT = ("Your last message ended the run, but $PRIME_OUT/result.json does not exist, so "
                  "the run will fail. Do whatever you said you would do next, then write that "
                  "file now. Do not end your turn until it is written.")
+# How long to wait before each request to finish. A run that stops with no result
+# is usually the model provider returning an empty turn while it is busy (many
+# reviews at once); asking again at once gets another empty turn, so wait first.
+FINISH_WAITS = (30, 60, 120)
+# How the model's last turn ended, from the event stream: its stop reason and any
+# error message. Logged when a run stops without a result.
+LAST_STOP: dict = {}
 
 def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
               command: str = "review", ci_data: dict | None = None) -> dict:
@@ -574,10 +581,16 @@ def run_prime(ctx: dict, mode: str, instruction: str, focus: str,
     started = time.time()
     log(f"running Prime ({mode}, resume={resume}, model {MODEL}, thinking {THINKING})")
     code, final_text = attempt(prompt, resume)
-    # The model sometimes ends its turn announcing its next step instead of taking it, which
-    # exits 0 with no result. Its session is intact, so ask once; a second miss fails the run.
-    if code == 0 and not regular_file(OUT / "result.json"):
-        log("Prime stopped without a result; asking it to finish")
+    # The model sometimes ends its turn without a result (an empty turn from a busy
+    # provider, or announcing its next step instead of taking it), which exits 0. Its
+    # session is intact, so ask it to finish after a wait, a few times with longer
+    # waits; when every attempt misses, the run fails.
+    for wait in FINISH_WAITS:
+        if code != 0 or regular_file(OUT / "result.json"):
+            break
+        log(f"Prime stopped without a result (last turn: {describe_stop(LAST_STOP)}); "
+            f"asking it to finish in {wait}s")
+        time.sleep(wait)
         code, more = attempt(FINISH_PROMPT, True)
         final_text = more or final_text
     as_prime([str(PRIME), "shutdown"], check=False)
@@ -693,8 +706,20 @@ def describe_code(code: str) -> str:
     return "(code)"
 
 
+def describe_stop(stop: dict) -> str:
+    """The last turn's stop reason, and its error message if it had one."""
+    if not stop:
+        return "no turn seen"
+    text = f"stop reason {stop.get('reason') or 'none'}"
+    if stop.get("error"):
+        text += f", error: {str(stop['error'])[:200]}"
+    return text
+
+
 def stream_progress(proc, started: float, deadline: int = 2400) -> str:
-    """Print one line per tool call and per model turn; return the final answer."""
+    """Print one line per tool call and per model turn; return the final answer.
+    The last turn's stop reason goes into LAST_STOP."""
+    LAST_STOP.clear()
     step = turn = 0
     tokens_in = tokens_out = 0
     cost = 0.0
@@ -724,6 +749,7 @@ def stream_progress(proc, started: float, deadline: int = 2400) -> str:
         elif t == "turn_end":
             turn += 1
             m = e.get("message") or {}
+            LAST_STOP.update(reason=m.get("stopReason"), error=m.get("errorMessage"))
             u = m.get("usage") or {}
             tokens_in += u.get("input", 0) or 0
             tokens_out += u.get("output", 0) or 0

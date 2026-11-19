@@ -173,9 +173,13 @@ UNTESTED on GitHub until the first run of a commit that contains it.
 
 ## Validation
 
-If Prime exits 0 without writing `result.json`, the action resumes its session once and asks it to
-finish. A second miss fails the run. Models sometimes end a turn by announcing the next step (seen
-on three homelab runs, 2026-11-06), which otherwise fails the check with nothing wrong in the change.
+If Prime exits 0 without writing `result.json`, the action resumes its session and asks it to
+finish, after waits of 30, 60 and 120 seconds (`FINISH_WAITS`); when all three miss, the run fails.
+Each retry logs how the last turn ended (stop reason and error message). Models sometimes end a turn
+by announcing the next step (seen on three homelab runs, 2026-11-06). On 2026-11-19 every homelab run
+that stopped without a result ran beside 4 to 11 other reviews, ended on an empty turn, and the one
+immediate retry missed too, so the retries now wait for the provider to free up. The waits are
+UNTESTED on GitHub until the first run of a commit that contains them.
 
 Run `python3 -I -m unittest discover -s tests -v` (run locally 2026-11-03).
 The test suite uses temporary local repositories and fake API calls, never

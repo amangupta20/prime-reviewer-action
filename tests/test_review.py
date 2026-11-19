@@ -7,6 +7,7 @@ import runpy
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -261,6 +262,7 @@ fix_check = ""
                             'as_prime': lambda *a, **k: None,
                             'collect_from_jail': lambda *a, **k: 'head',
                             'stream_progress': lambda proc, started: 'last words',
+                            'FINISH_WAITS': (0, 0, 0),
                             'SESSION': self.work / 'session'}), \
                 patch.object(g['subprocess'], 'Popen', popen):
             res = fn({'base': 'b', 'head': 'h', 'pr': {'title': 'T', 'body': 'B'}},
@@ -280,10 +282,25 @@ fix_check = ""
         self.assertIn('result.json', calls[1][-1])
         self.assertEqual(res['result'], {'verdict': 'approve'})
 
-    def test_second_miss_fails_the_run(self):
-        res, calls = self._run_prime_with_results([False, False])
-        self.assertEqual(len(calls), 2)
+    def test_prime_is_asked_again_after_a_second_miss(self):
+        res, calls = self._run_prime_with_results([False, False, True])
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all('-c' in c for c in calls[1:]))
+        self.assertEqual(res['result'], {'verdict': 'approve'})
+
+    def test_every_miss_fails_the_run(self):
+        res, calls = self._run_prime_with_results([False, False, False, False])
+        self.assertEqual(len(calls), 4)
         self.assertIsNone(res['result'])
+
+    def test_the_last_turn_stop_reason_is_kept(self):
+        g = self.load()['stream_progress'].__globals__
+        class Proc:
+            stdout = [json.dumps({'type': 'turn_end', 'message': {
+                'stopReason': 'error', 'errorMessage': '429: busy', 'content': []}}) + '\n']
+        g['stream_progress'](Proc(), time.time())
+        self.assertEqual(g['describe_stop'](g['LAST_STOP']), 'stop reason error, error: 429: busy')
+        self.assertEqual(g['describe_stop']({}), 'no turn seen')
 
     def test_prime_gets_the_description_as_untrusted_data(self):
         text = self.mod['pr_description']({'title': 'Add X', 'body': 'Plan: 1 to add'})
